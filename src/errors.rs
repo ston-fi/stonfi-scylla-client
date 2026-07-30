@@ -24,15 +24,6 @@ pub enum ScyllaClientError {
         #[source]
         source: Box<dyn Error + Send + Sync + 'static>,
     },
-    /// A single configured endpoint could not be resolved.
-    #[error("failed to resolve Scylla endpoint `{endpoint}`")]
-    ResolveEndpoint {
-        /// Endpoint supplied by the caller.
-        endpoint: String,
-        /// Underlying resolver failure.
-        #[source]
-        source: Box<dyn Error + Send + Sync + 'static>,
-    },
     /// Establishing the driver session failed.
     #[error("failed to connect to ScyllaDB")]
     Connect {
@@ -90,16 +81,6 @@ impl ScyllaClientError {
     pub(crate) fn metrics(source: anyhow::Error) -> Self {
         Self::Metrics {
             source: source.into_boxed_dyn_error(),
-        }
-    }
-
-    pub(crate) fn resolve_endpoint(
-        endpoint: impl Into<String>,
-        source: impl Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::ResolveEndpoint {
-            endpoint: endpoint.into(),
-            source: Box::new(source),
         }
     }
 

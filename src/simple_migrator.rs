@@ -13,9 +13,10 @@ pub struct SimpleMigrator {
 }
 
 impl SimpleMigrator {
-    /// Create a migrator backed by `client`.
+    /// Create a migrator using the client's validated keyspace configuration.
     #[must_use]
-    pub fn new(client: ScyllaClient, config: KeyspaceConfig) -> Self {
+    pub fn new(client: ScyllaClient) -> Self {
+        let config = client.keyspace_config();
         Self { client, config }
     }
 
@@ -61,7 +62,7 @@ impl SimpleMigrator {
     /// This is intentionally not a full CQL parser. Block comments and
     /// dollar-quoted values are not interpreted.
     #[must_use]
-    pub fn split_statements(source: &str) -> Vec<String> {
+    fn split_statements(source: &str) -> Vec<String> {
         let characters = source.chars().collect::<Vec<_>>();
         let mut statements = Vec::new();
         let mut statement = String::new();

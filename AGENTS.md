@@ -43,14 +43,22 @@ semaphore, and metrics. The crate requires Tokio but does not spawn or own
 background tasks.
 
 The public configuration fields are an intentional serialization and
-struct-literal contract. Preserve their names, types, and millisecond units
-unless a versioned breaking change is explicitly requested. Add validation at
-construction rather than silently normalizing invalid values.
+struct-literal contract. Preserve their names and types unless a versioned
+breaking change is explicitly requested. `endpoints` is a comma-separated
+string so generic environment configuration loaders can override it directly.
+The request timeout and retry delays are `Duration` values deserialized through
+`humantime_serde`; missing retry blocks and fields use the documented
+`RetryConfig` defaults. Configuration structs reject unknown fields. Add
+validation at construction rather than silently normalizing invalid values.
 
 ## Queries, errors, and metrics
 
 - Prefer prepared methods for data queries. Use `execute_unprepared` only for
   statements such as `USE` and schema migrations.
+- Preserve per-statement configuration through the upstream driver's
+  `CachingSession`, except for statement-level retry policies, which the client
+  overrides so `RetryConfig` remains the sole retry owner. Do not add a second
+  prepared-statement cache.
 - Never interpolate untrusted values into unprepared CQL.
 - Keep prepared statements marked idempotent only while all supported query
   methods are safe to retry.
@@ -67,11 +75,12 @@ construction rather than silently normalizing invalid values.
 
 ## Simple migrations
 
-`SimpleMigrator` is intentionally stateless and reruns all supplied statements.
-Keep its keyspace placeholders stable. Changes to splitting must include
-deterministic tests for line endings, comments, delimiters, and quoting. Do not
-present it as a versioned migration system or expand it into a full parser
-without an explicit design task.
+`SimpleMigrator` is intentionally stateless, derives the validated keyspace
+configuration from its client, and reruns all supplied statements. Keep its
+keyspace placeholders stable. Changes to splitting must include deterministic
+tests for line endings, comments, delimiters, and quoting. Keep the incomplete
+splitter private; do not present it as a public parser or expand it into a
+versioned migration system without an explicit design task.
 
 ## Public-library changes
 

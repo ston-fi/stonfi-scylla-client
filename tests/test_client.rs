@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::net::TcpListener;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -6,14 +7,12 @@ use scylla::response::PagingState;
 use scylla::statement::Statement;
 use scylla::{DeserializeRow, SerializeRow};
 use stonfi_scylla_client::client::ScyllaClient;
-use stonfi_scylla_client::config::{KeyspaceConfig, ScyllaClientConfig};
+use stonfi_scylla_client::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig};
 use stonfi_scylla_client::errors::ScyllaClientError;
 use stonfi_scylla_client::simple_migrator::SimpleMigrator;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-
-const SCYLLA_PORT: u16 = 9042;
 
 const CREATE_KEYSPACE_QUERY: &str = "
 // Create keyspace if it does not exist
@@ -38,9 +37,14 @@ struct TestObject {
 
 #[tokio::test]
 async fn test_client_end_to_end() -> anyhow::Result<()> {
+    let port_reservation = TcpListener::bind(("127.0.0.1", 0))?;
+    let listening_port = port_reservation.local_addr()?.port();
+    drop(port_reservation);
+    let listening_port_arg = listening_port.to_string();
+
     let container = GenericImage::new("scylladb/scylla", "6.0")
-        .with_exposed_port(SCYLLA_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr("initialization completed"))
+        .with_mapped_port(listening_port, listening_port.tcp())
         .with_cmd([
             "--smp",
             "1",
@@ -56,27 +60,34 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
             "false",
             "--developer-mode",
             "1",
+            "--rpc-address",
+            "0.0.0.0",
+            "--broadcast-rpc-address",
+            "127.0.0.1",
+            "--native-transport-port",
+            listening_port_arg.as_str(),
         ])
         .start()
         .await?;
 
-    let listening_port = container.get_host_port_ipv4(SCYLLA_PORT).await?;
     let config = ScyllaClientConfig {
-        url: format!("127.0.0.1:{listening_port}"),
+        endpoints: format!("127.0.0.1:{listening_port}"),
         max_parallel_queries: 4,
         keyspace: KeyspaceConfig {
             name: format!("scylla_client_test_{}", std::process::id()),
             replication_factor: 1,
         },
-        request_timeout_ms: 2_000,
-        retry_count: 3,
-        initial_retry_delay_ms: 25,
-        max_retry_delay_ms: 250,
+        request_timeout: Duration::from_secs(2),
+        retry: RetryConfig {
+            max_retries: 3,
+            min_delay: Duration::from_millis(25),
+            max_delay: Duration::from_millis(250),
+        },
     };
 
     let client = ScyllaClient::new(&config).await?;
     wait_for_scylla(&client, &container).await?;
-    let migrator = SimpleMigrator::new(client.clone(), config.keyspace.clone());
+    let migrator = SimpleMigrator::new(client.clone());
     migrator
         .apply_all(&[CREATE_KEYSPACE_QUERY.to_owned()])
         .await?;
@@ -167,6 +178,20 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
             .await?;
     }
 
+    let query_with_small_page: Statement =
+        Into::<Statement>::into("SELECT * FROM test_object WHERE field1 <= ? ALLOW FILTERING")
+            .with_page_size(7);
+    let (small_page, _) = client
+        .select_page::<TestObject>(
+            "test_object",
+            query_with_small_page,
+            (50,),
+            PagingState::start(),
+            Some("small_page_test_objects"),
+        )
+        .await?;
+    assert_eq!(small_page.len(), 7);
+
     let query: Statement =
         Into::<Statement>::into("SELECT * FROM test_object WHERE field1 <= ? ALLOW FILTERING")
             .with_page_size(10);
@@ -174,7 +199,7 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     let mut paged_rows = HashSet::new();
     loop {
         let (rows, control_flow) = client
-            .select_single_page::<TestObject>(
+            .select_page::<TestObject>(
                 "test_object",
                 query.clone(),
                 (50,),

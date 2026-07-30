@@ -15,31 +15,39 @@ crates.io.
 ```toml
 [dependencies]
 stonfi_scylla_client = { git = "https://github.com/ston-fi/stonfi-scylla-client", tag = "v0.0.1" }
-stonfi_metrics = { version = "0.0.1", git = "https://github.com/ston-fi/stonfi-metrics", rev = "v0.0.1" }
+stonfi_metrics = { version = "0.0.1", git = "https://github.com/ston-fi/stonfi-metrics", tag = "v0.0.1" }
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The crate requires Rust 1.88 or newer and a Tokio runtime.
+The crate requires Rust 1.88 or newer and a Tokio runtime. The quick start uses
+`anyhow` and Tokio's macros and multithreaded runtime features; applications may
+use their existing error and runtime setup instead.
 
 ## Quick start
 
 ```rust
+use std::time::Duration;
+
 use stonfi_scylla_client::client::ScyllaClient;
-use stonfi_scylla_client::config::{KeyspaceConfig, ScyllaClientConfig};
+use stonfi_scylla_client::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig};
 
 # async fn connect() -> anyhow::Result<()> {
 stonfi_metrics::init_metrics!()?;
 
 let config = ScyllaClientConfig {
-    url: "127.0.0.1:9042".to_owned(),
+    endpoints: "127.0.0.1:9042".to_owned(),
     max_parallel_queries: 64,
     keyspace: KeyspaceConfig {
         name: "my_service".to_owned(),
         replication_factor: 3,
     },
-    request_timeout_ms: 5_000,
-    retry_count: 3,
-    initial_retry_delay_ms: 50,
-    max_retry_delay_ms: 1_000,
+    request_timeout: Duration::from_secs(5),
+    retry: RetryConfig {
+        max_retries: 3,
+        min_delay: Duration::from_millis(50),
+        max_delay: Duration::from_secs(1),
+    },
 };
 
 let client = ScyllaClient::new(&config).await?;
@@ -60,13 +68,20 @@ println!("received {} row(s)", rows.len());
 ```
 
 See [`examples/connect.rs`](examples/connect.rs) for a runnable version.
+The `config::ScyllaClientConfig` rustdoc includes a complete YAML example with
+human-readable retry durations. A missing `retry` block, or omitted fields
+inside it, use `RetryConfig::default()`.
 
 ## Behavior
 
-- `select`, `select_one`, `select_row`, `select_single_page`, `insert`, and
+- `select`, `select_one`, `select_row`, `select_page`, `insert`, and
   `delete` use prepared statements and the configured retry policy.
-- `execute_unprepared` performs one attempt. It is intended for `USE` and schema
-  migrations and must never interpolate untrusted input.
+- Prepared statements are marked idempotent. Write queries supplied to
+  `insert` and `delete` must therefore be safe to replay.
+- The configured exponential retry policy is the sole retry mechanism;
+  statement-level driver retry policies are ignored.
+- `execute_unprepared` performs one attempt. It is intended for `USE` and
+  schema migrations and must never interpolate untrusted input.
 - Cloned clients share a session, prepared-statement cache, concurrency limit,
   and process-global metrics.
 - `select_one` returns an error when a successful query produces more than one
@@ -89,16 +104,19 @@ Query counters and durations use `table_name`, `query_type`, `status`, and
 normal applications should also initialize `stonfi_metrics` during startup to
 serve the global registry.
 
+Use stable, bounded `table` and `query_tag` values. Record identifiers, request
+IDs, and other unbounded values create excessive Prometheus label cardinality.
+
 Do not link this crate and `stonfi-commons-scylla-client` into the same process.
 Both own the same metric names, so initialization would fail rather than
 silently produce duplicate collectors.
 
 ## Simple migrations
 
-`simple_migrator::SimpleMigrator` substitutes `[[KEYSPACE_NAME]]` and
-`[[REPLICATION_FACTOR]]`, then executes each CQL statement without preparation.
-It does not track migration versions or checksums, so migration statements
-should be idempotent.
+`simple_migrator::SimpleMigrator` uses the client's validated keyspace
+configuration, substitutes `[[KEYSPACE_NAME]]` and `[[REPLICATION_FACTOR]]`,
+then executes each CQL statement without preparation. It does not track
+migration versions or checksums, so migration statements should be idempotent.
 
 The splitter supports LF and CRLF, final statements without semicolons,
 full-line `--` and `//` comments, and semicolons inside single- or double-quoted
@@ -113,6 +131,13 @@ dollar-quoted values.
 - Replace `anyhow::Result` assumptions with
   `errors::ScyllaClientResult`/`ScyllaClientError` where errors are matched.
 - Rename raw `execute` calls to `execute_unprepared`.
+- Rename `select_single_page` calls to `select_page`.
+- Rename the `url` configuration field to `endpoints`; its value remains a
+  comma-separated string suitable for environment-variable overrides.
+- Rename `request_timeout_ms` to `request_timeout` and use a human-readable
+  duration such as `5s`.
+- Replace the top-level retry fields with the nested `retry` policy. YAML retry
+  delays now use human-readable durations such as `50ms` and `1s`.
 - Remove `provide_metrics` collector wiring and initialize `stonfi_metrics`
   during application startup.
 - Switch atomically; do not run both clients in one process because their

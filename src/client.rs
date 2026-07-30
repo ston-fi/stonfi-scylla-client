@@ -1,26 +1,23 @@
 use std::error::Error;
 use std::future::Future;
-use std::net::SocketAddr;
-use std::ops::{ControlFlow, Deref};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use futures_util::StreamExt;
+use scylla::client::caching_session::{CachingSession, CachingSessionBuilder};
 use scylla::client::execution_profile::ExecutionProfile;
-use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
-use scylla::errors::TranslationError;
 use scylla::frame::Compression;
-use scylla::policies::address_translator::{AddressTranslator, UntranslatedPeer};
+use scylla::policies::retry::FallthroughRetryPolicy;
 use scylla::response::PagingState;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::Statement;
 use scylla::statement::prepared::PreparedStatement;
 use scylla::value::Row;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
-use crate::config::{ScyllaClientConfig, validate_config};
+use crate::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig, validate_config};
 use crate::errors::{ScyllaClientError, ScyllaClientResult};
 use crate::metrics::ScyllaClientMetrics;
 use crate::types::QueryType;
@@ -30,7 +27,7 @@ const QUERY_TAG_DEFAULT_SELECT: &str = "select_default";
 const QUERY_TAG_DEFAULT_SELECT_ONE: &str = "select_one_default";
 const QUERY_TAG_DEFAULT_INSERT: &str = "insert_default";
 const QUERY_TAG_DEFAULT_SELECT_ROW: &str = "select_row_default";
-const QUERY_TAG_DEFAULT_SELECT_SINGLE_PAGE: &str = "select_single_page_default";
+const QUERY_TAG_DEFAULT_SELECT_PAGE: &str = "select_page_default";
 const QUERY_TAG_DEFAULT_EXECUTE_SUCCESS: &str = "update_success_default";
 const QUERY_TAG_DEFAULT_QUERY_ERROR: &str = "query_error_default";
 const QUERY_TAG_DEFAULT_DELETE: &str = "delete_default";
@@ -47,31 +44,13 @@ impl<T> DeserRow for T where
 {
 }
 
-#[derive(Clone, Copy)]
-struct RetryConfig {
-    initial_delay: Duration,
-    max_delay: Duration,
-    max_retries: u32,
-}
-
-impl RetryConfig {
-    async fn execute<F, Fut, T, E>(&self, operation: F) -> Result<T, E>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-    {
-        tryhard::retry_fn(operation)
-            .retries(self.max_retries)
-            .exponential_backoff(self.initial_delay)
-            .max_delay(self.max_delay)
-            .await
-    }
-}
-
 /// Cloneable ScyllaDB client with bounded concurrency and retry behavior.
 ///
 /// Clones share the driver session, prepared-statement cache, concurrency
 /// semaphore, and process-global metrics.
+///
+/// The `table` and `query_tag` arguments become Prometheus labels. Use stable,
+/// bounded values rather than record identifiers or other unbounded input.
 #[derive(Clone)]
 pub struct ScyllaClient {
     inner: Arc<Inner>,
@@ -82,31 +61,21 @@ impl ScyllaClient {
     /// Validate configuration, initialize metrics, and connect to ScyllaDB.
     ///
     /// The driver uses LZ4 compression, `LocalQuorum` consistency, and the
-    /// configured request timeout. When exactly one endpoint is configured,
-    /// discovered peer addresses are translated to that endpoint's resolved
-    /// socket address, including its configured port. This supports proxy and
-    /// network-address-translation endpoints.
+    /// configured request timeout.
     ///
     /// # Errors
     ///
     /// Returns [`ScyllaClientError::InvalidConfig`] for invalid configuration,
     /// [`ScyllaClientError::Metrics`] when metric registration fails,
-    /// [`ScyllaClientError::ResolveEndpoint`] when a single endpoint cannot be
-    /// resolved, or [`ScyllaClientError::Connect`] when the driver session
-    /// cannot be established.
+    /// or [`ScyllaClientError::Connect`] when the driver session cannot be
+    /// established.
     pub async fn new(config: &ScyllaClientConfig) -> ScyllaClientResult<Self> {
         let endpoints = validate_config(config)?;
         let metrics = ScyllaClientMetrics::initialize()?;
         let inner = Inner::new(config, &endpoints, metrics).await?;
-        let retry_config = RetryConfig {
-            initial_delay: Duration::from_millis(config.initial_retry_delay_ms),
-            max_delay: Duration::from_millis(config.max_retry_delay_ms),
-            max_retries: config.retry_count,
-        };
-
         Ok(Self {
             inner: Arc::new(inner),
-            retry_config,
+            retry_config: config.retry,
         })
     }
 
@@ -127,12 +96,11 @@ impl ScyllaClient {
         query_tag: Option<&str>,
     ) -> ScyllaClientResult<Vec<R>> {
         let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT);
-        self.retry_config
-            .execute(|| {
-                self.inner
-                    .select(table, query.clone(), values.clone(), query_tag)
-            })
-            .await
+        execute_with_retry(&self.retry_config, || {
+            self.inner
+                .select(table, query.clone(), values.clone(), query_tag)
+        })
+        .await
     }
 
     /// Execute a prepared query that must return zero or one row.
@@ -153,13 +121,11 @@ impl ScyllaClient {
         query_tag: Option<&str>,
     ) -> ScyllaClientResult<Option<R>> {
         let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_ONE);
-        let rows = self
-            .retry_config
-            .execute(|| {
-                self.inner
-                    .select::<R>(table, query.clone(), values.clone(), query_tag)
-            })
-            .await?;
+        let rows = execute_with_retry(&self.retry_config, || {
+            self.inner
+                .select::<R>(table, query.clone(), values.clone(), query_tag)
+        })
+        .await?;
         into_optional_single(table, query_tag, rows)
     }
 
@@ -177,12 +143,11 @@ impl ScyllaClient {
         query_tag: Option<&str>,
     ) -> ScyllaClientResult<Vec<Row>> {
         let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_ROW);
-        self.retry_config
-            .execute(|| {
-                self.inner
-                    .select(table, query.clone(), values.clone(), query_tag)
-            })
-            .await
+        execute_with_retry(&self.retry_config, || {
+            self.inner
+                .select(table, query.clone(), values.clone(), query_tag)
+        })
+        .await
     }
 
     /// Execute one page of a prepared query.
@@ -194,7 +159,7 @@ impl ScyllaClient {
     ///
     /// Returns [`ScyllaClientError::Prepare`] or
     /// [`ScyllaClientError::Query`] after retry attempts are exhausted.
-    pub async fn select_single_page<R: DeserRow>(
+    pub async fn select_page<R: DeserRow>(
         &self,
         table: &str,
         query: impl Into<Statement> + Clone,
@@ -202,21 +167,23 @@ impl ScyllaClient {
         paging_state: PagingState,
         query_tag: Option<&str>,
     ) -> ScyllaClientResult<(Vec<R>, ControlFlow<(), PagingState>)> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_SINGLE_PAGE);
-        self.retry_config
-            .execute(|| {
-                self.inner.select_single_page(
-                    table,
-                    query.clone(),
-                    values.clone(),
-                    paging_state.clone(),
-                    query_tag,
-                )
-            })
-            .await
+        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_PAGE);
+        execute_with_retry(&self.retry_config, || {
+            self.inner.select_page(
+                table,
+                query.clone(),
+                values.clone(),
+                paging_state.clone(),
+                query_tag,
+            )
+        })
+        .await
     }
 
     /// Execute a prepared insert statement.
+    ///
+    /// The statement is marked idempotent and may be attempted more than once.
+    /// Only use this method for writes that are safe to replay.
     ///
     /// # Errors
     ///
@@ -230,15 +197,17 @@ impl ScyllaClient {
         query_tag: Option<&str>,
     ) -> ScyllaClientResult<()> {
         let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_INSERT);
-        self.retry_config
-            .execute(|| {
-                self.inner
-                    .query(table, query.clone(), values.clone(), Insert, query_tag)
-            })
-            .await
+        execute_with_retry(&self.retry_config, || {
+            self.inner
+                .query(table, query.clone(), values.clone(), Insert, query_tag)
+        })
+        .await
     }
 
     /// Execute a prepared delete statement.
+    ///
+    /// The statement is marked idempotent and may be attempted more than once.
+    /// Only use this method for writes that are safe to replay.
     ///
     /// # Errors
     ///
@@ -252,12 +221,11 @@ impl ScyllaClient {
         query_tag: Option<&str>,
     ) -> ScyllaClientResult<()> {
         let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_DELETE);
-        self.retry_config
-            .execute(|| {
-                self.inner
-                    .query(table, query.clone(), values.clone(), Delete, query_tag)
-            })
-            .await
+        execute_with_retry(&self.retry_config, || {
+            self.inner
+                .query(table, query.clone(), values.clone(), Delete, query_tag)
+        })
+        .await
     }
 
     /// Select the configured keyspace for this driver session.
@@ -270,10 +238,8 @@ impl ScyllaClient {
     /// Returns [`ScyllaClientError::Query`] after retry attempts are
     /// exhausted.
     pub async fn use_keyspace(&self) -> ScyllaClientResult<()> {
-        let query = format!("USE {}", self.inner.keyspace);
-        self.retry_config
-            .execute(|| self.execute_unprepared(&query))
-            .await
+        let query = format!("USE {}", self.inner.keyspace.name);
+        execute_with_retry(&self.retry_config, || self.execute_unprepared(&query)).await
     }
 
     /// Execute raw CQL without preparing it.
@@ -291,6 +257,22 @@ impl ScyllaClient {
             .execute_unprepared("execute(no_table)", query)
             .await
     }
+
+    pub(crate) fn keyspace_config(&self) -> KeyspaceConfig {
+        self.inner.keyspace.clone()
+    }
+}
+
+async fn execute_with_retry<F, Fut, T, E>(config: &RetryConfig, operation: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    tryhard::retry_fn(operation)
+        .retries(config.max_retries)
+        .exponential_backoff(config.min_delay)
+        .max_delay(config.max_delay)
+        .await
 }
 
 fn into_optional_single<T>(
@@ -310,27 +292,10 @@ fn into_optional_single<T>(
     }
 }
 
-#[derive(Debug)]
-struct RpcAddressTranslator {
-    known_node_address: SocketAddr,
-}
-
-#[async_trait::async_trait]
-impl AddressTranslator for RpcAddressTranslator {
-    async fn translate_address(
-        &self,
-        _untranslated_peer: &UntranslatedPeer,
-    ) -> Result<SocketAddr, TranslationError> {
-        Ok(self.known_node_address)
-    }
-}
-
 struct Inner {
-    session: Session,
-    keyspace: String,
+    session: CachingSession,
+    keyspace: KeyspaceConfig,
     active_queries: Semaphore,
-    prepared_statements: DashMap<String, Arc<PreparedStatement>>,
-    prepared_statements_lock: tokio::sync::Mutex<()>,
     metrics: &'static ScyllaClientMetrics,
 }
 
@@ -341,31 +306,14 @@ impl Inner {
         metrics: &'static ScyllaClientMetrics,
     ) -> ScyllaClientResult<Self> {
         let profile = ExecutionProfile::builder()
-            .request_timeout(Some(Duration::from_millis(config.request_timeout_ms)))
+            .request_timeout(Some(config.request_timeout))
             .consistency(scylla::statement::Consistency::LocalQuorum)
+            .retry_policy(Arc::new(FallthroughRetryPolicy::new()))
             .build();
 
         let mut session_builder = SessionBuilder::new();
         for endpoint in endpoints {
             session_builder = session_builder.known_node(endpoint);
-        }
-
-        if let [endpoint] = endpoints {
-            let known_node_address = tokio::net::lookup_host(endpoint)
-                .await
-                .map_err(|error| ScyllaClientError::resolve_endpoint(*endpoint, error))?
-                .next()
-                .ok_or_else(|| {
-                    ScyllaClientError::resolve_endpoint(
-                        *endpoint,
-                        std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "resolver returned no addresses",
-                        ),
-                    )
-                })?;
-            session_builder = session_builder
-                .address_translator(Arc::new(RpcAddressTranslator { known_node_address }));
         }
 
         let session = session_builder
@@ -376,29 +324,21 @@ impl Inner {
             .map_err(ScyllaClientError::connect)?;
 
         Ok(Self {
-            session,
-            keyspace: config.keyspace.name.clone(),
+            session: CachingSessionBuilder::new(session).build(),
+            keyspace: config.keyspace.clone(),
             active_queries: Semaphore::new(config.max_parallel_queries),
-            prepared_statements: DashMap::new(),
-            prepared_statements_lock: tokio::sync::Mutex::new(()),
             metrics,
         })
     }
 
     async fn execute_unprepared(&self, table: &str, query: &str) -> ScyllaClientResult<()> {
         let start_time = Instant::now();
-        let _active_query = self.active_queries.acquire().await.map_err(|error| {
-            self.query_error(
-                table,
-                Execute,
-                error,
-                start_time.elapsed(),
-                QUERY_TAG_DEFAULT_QUERY_ERROR,
-            )
-        })?;
+        let _active_query = self
+            .acquire_query_permit(table, Execute, QUERY_TAG_DEFAULT_QUERY_ERROR, start_time)
+            .await?;
 
         log::trace!("Executing unprepared query: {query:?}");
-        match self.session.query_unpaged(query, &()).await {
+        match self.session.get_session().query_unpaged(query, &()).await {
             Ok(_) => {
                 self.metrics.update_success(
                     table,
@@ -427,15 +367,20 @@ impl Inner {
         query_tag: &str,
     ) -> ScyllaClientResult<()> {
         let start_time = Instant::now();
-        let _active_query = self.active_queries.acquire().await.map_err(|error| {
-            self.query_error(table, query_type, error, start_time.elapsed(), query_tag)
-        })?;
+        let _active_query = self
+            .acquire_query_permit(table, query_type, query_tag, start_time)
+            .await?;
         let prepared_query = self
             .prepare_query(table, query, query_type, query_tag)
             .await?;
 
         log::trace!("Executing prepared query: {prepared_query:?}");
-        match self.session.execute_unpaged(&prepared_query, values).await {
+        match self
+            .session
+            .get_session()
+            .execute_unpaged(&prepared_query, values)
+            .await
+        {
             Ok(_) => {
                 self.metrics
                     .update_success(table, query_type, start_time.elapsed(), query_tag);
@@ -455,23 +400,16 @@ impl Inner {
         query_tag: &str,
     ) -> ScyllaClientResult<Vec<R>> {
         let start_time = Instant::now();
-        let _active_query = {
-            let permit = self.active_queries.acquire().await.map_err(|error| {
-                self.query_error(table, Select, error, start_time.elapsed(), query_tag)
-            })?;
-            self.metrics.update_wait_connection(start_time.elapsed());
-            permit
-        };
+        let _active_query = self
+            .acquire_query_permit(table, Select, query_tag, start_time)
+            .await?;
 
-        let prepared_query = self
-            .prepare_query(table, query, Select, query_tag)
-            .await?
-            .deref()
-            .clone();
+        let prepared_query = self.prepare_query(table, query, Select, query_tag).await?;
         log::trace!("Executing prepared query: {prepared_query:?}");
 
         let query_result = self
             .session
+            .get_session()
             .execute_iter(prepared_query, values)
             .await
             .map_err(|error| {
@@ -493,7 +431,7 @@ impl Inner {
         Ok(result)
     }
 
-    async fn select_single_page<R: DeserRow>(
+    async fn select_page<R: DeserRow>(
         &self,
         table: &str,
         query: impl Into<Statement>,
@@ -502,23 +440,16 @@ impl Inner {
         query_tag: &str,
     ) -> ScyllaClientResult<(Vec<R>, ControlFlow<(), PagingState>)> {
         let start_time = Instant::now();
-        let _active_query = {
-            let permit = self.active_queries.acquire().await.map_err(|error| {
-                self.query_error(table, Select, error, start_time.elapsed(), query_tag)
-            })?;
-            self.metrics.update_wait_connection(start_time.elapsed());
-            permit
-        };
+        let _active_query = self
+            .acquire_query_permit(table, Select, query_tag, start_time)
+            .await?;
 
-        let prepared_query = self
-            .prepare_query(table, query, Select, query_tag)
-            .await?
-            .deref()
-            .clone();
+        let prepared_query = self.prepare_query(table, query, Select, query_tag).await?;
         log::trace!("Executing prepared query: {prepared_query:?}");
 
         let (query_result, paging_state_response) = self
             .session
+            .get_session()
             .execute_single_page(&prepared_query, values, paging_state)
             .await
             .map_err(|error| {
@@ -545,29 +476,35 @@ impl Inner {
         query: impl Into<Statement>,
         query_type: QueryType,
         query_tag: &str,
-    ) -> ScyllaClientResult<Arc<PreparedStatement>> {
+    ) -> ScyllaClientResult<PreparedStatement> {
         let query = query.into();
-        if let Some(prepared_statement) = self.prepared_statements.get(&query.contents) {
-            return Ok(prepared_statement.value().clone());
-        }
-
-        let _lock = self.prepared_statements_lock.lock().await;
-        if let Some(prepared_statement) = self.prepared_statements.get(&query.contents) {
-            return Ok(prepared_statement.value().clone());
-        }
-
         log::trace!("Preparing query: {}", query.contents);
-        let key = query.contents.clone();
-        let prepared_statement = self.session.prepare(query).await.map_err(|error| {
-            let operation: &str = query_type.into();
-            ScyllaClientError::prepare(operation, table, query_tag, error)
-        })?;
+        let prepared_statement =
+            self.session
+                .add_prepared_statement(&query)
+                .await
+                .map_err(|error| {
+                    let operation: &str = query_type.into();
+                    ScyllaClientError::prepare(operation, table, query_tag, error)
+                })?;
         let mut prepared_statement = prepared_statement;
+        prepared_statement.set_retry_policy(Some(Arc::new(FallthroughRetryPolicy::new())));
         prepared_statement.set_is_idempotent(true);
-        let prepared_statement = Arc::new(prepared_statement);
-        self.prepared_statements
-            .insert(key, prepared_statement.clone());
         Ok(prepared_statement)
+    }
+
+    async fn acquire_query_permit(
+        &self,
+        table: &str,
+        query_type: QueryType,
+        query_tag: &str,
+        start_time: Instant,
+    ) -> ScyllaClientResult<SemaphorePermit<'_>> {
+        let permit = self.active_queries.acquire().await.map_err(|error| {
+            self.query_error(table, query_type, error, start_time.elapsed(), query_tag)
+        })?;
+        self.metrics.update_wait_connection(start_time.elapsed());
+        Ok(permit)
     }
 
     fn query_error(
@@ -594,27 +531,27 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use super::{RetryConfig, into_optional_single};
+    use super::{execute_with_retry, into_optional_single};
+    use crate::config::RetryConfig;
     use crate::errors::ScyllaClientError;
 
     #[tokio::test]
     async fn test_retry_config_stops_after_configured_retries() {
         let attempts = Arc::new(AtomicU32::new(0));
         let retry_config = RetryConfig {
-            initial_delay: Duration::from_millis(1),
+            min_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(1),
             max_retries: 3,
         };
 
-        let result = retry_config
-            .execute(|| {
-                let attempts = Arc::clone(&attempts);
-                async move {
-                    attempts.fetch_add(1, Ordering::Relaxed);
-                    Err::<(), _>("retry")
-                }
-            })
-            .await;
+        let result = execute_with_retry(&retry_config, || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>("retry")
+            }
+        })
+        .await;
 
         assert_eq!(result, Err("retry"));
         assert_eq!(attempts.load(Ordering::Relaxed), 4);

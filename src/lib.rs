@@ -12,23 +12,27 @@
 //! # Example
 //!
 //! ```no_run
+//! use std::time::Duration;
+//!
 //! use stonfi_scylla_client::client::ScyllaClient;
-//! use stonfi_scylla_client::config::{KeyspaceConfig, ScyllaClientConfig};
+//! use stonfi_scylla_client::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig};
 //!
 //! # async fn connect() -> anyhow::Result<()> {
 //! stonfi_metrics::init_metrics!()?;
 //!
 //! let config = ScyllaClientConfig {
-//!     url: "127.0.0.1:9042".to_owned(),
+//!     endpoints: "127.0.0.1:9042".to_owned(),
 //!     max_parallel_queries: 64,
 //!     keyspace: KeyspaceConfig {
 //!         name: "my_service".to_owned(),
 //!         replication_factor: 3,
 //!     },
-//!     request_timeout_ms: 5_000,
-//!     retry_count: 3,
-//!     initial_retry_delay_ms: 50,
-//!     max_retry_delay_ms: 1_000,
+//!     request_timeout: Duration::from_secs(5),
+//!     retry: RetryConfig {
+//!         max_retries: 3,
+//!         min_delay: Duration::from_millis(50),
+//!         max_delay: Duration::from_secs(1),
+//!     },
 //! };
 //!
 //! let client = ScyllaClient::new(&config).await?;
@@ -39,7 +43,7 @@
 
 /// Instrumented ScyllaDB client and row deserialization bound.
 pub mod client;
-/// Deserializable client and keyspace configuration.
+/// Deserializable client, keyspace, and retry configuration.
 pub mod config;
 /// Errors returned by client and migration operations.
 pub mod errors;
