@@ -1,0 +1,45 @@
+[package]
+name = "stonfi_scylla_client"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+authors = ["STON.fi"]
+description = "ScyllaDB client with retries, metrics, prepared statement caching, and simple CQL migrations"
+license = "Apache-2.0"
+repository = "https://github.com/ston-fi/stonfi-scylla-client"
+readme = "README.md"
+publish = false
+
+include = [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "examples/**",
+    "src/**",
+]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dashmap = "6.1"
+futures-util = "0.3"
+log = "0.4"
+scylla = "1.7"
+serde = { version = "1", features = ["derive"] }
+stonfi_metrics = { version = "0.0.1", git = "https://github.com/ston-fi/stonfi-metrics", rev = "v0.0.1" }
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["net", "sync", "time"] }
+tryhard = "0.5.2"
+
+[dev-dependencies]
+testcontainers = "0.27.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[[example]]
+name = "connect"
+
+[profile.release]
+debug = true
