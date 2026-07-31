@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::error::Error;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -23,20 +24,12 @@ use crate::metrics::ScyllaClientMetrics;
 use crate::types::QueryType;
 use crate::types::QueryType::{Delete, Execute, Insert, Select};
 
-const QUERY_TAG_DEFAULT_SELECT: &str = "select_default";
-const QUERY_TAG_DEFAULT_SELECT_ONE: &str = "select_one_default";
-const QUERY_TAG_DEFAULT_INSERT: &str = "insert_default";
-const QUERY_TAG_DEFAULT_SELECT_ROW: &str = "select_row_default";
-const QUERY_TAG_DEFAULT_SELECT_PAGE: &str = "select_page_default";
-const QUERY_TAG_DEFAULT_EXECUTE_SUCCESS: &str = "update_success_default";
-const QUERY_TAG_DEFAULT_QUERY_ERROR: &str = "query_error_default";
-const QUERY_TAG_DEFAULT_DELETE: &str = "delete_default";
+const TABLE_UNKNOWN: &str = "unknown";
 
 /// Row types that can be deserialized by the upstream Scylla driver.
 ///
-/// This trait is implemented automatically for every compatible driver row
-/// type. Consumers should derive [`scylla::DeserializeRow`] rather than
-/// implementing this trait directly.
+/// Implemented automatically for types compatible with
+/// [`scylla::DeserializeRow`].
 pub trait DeserRow: for<'a, 'b> scylla::deserialize::row::DeserializeRow<'a, 'b> + 'static {}
 
 impl<T> DeserRow for T where
@@ -44,13 +37,10 @@ impl<T> DeserRow for T where
 {
 }
 
-/// Cloneable ScyllaDB client with bounded concurrency and retry behavior.
+/// ScyllaDB client with bounded concurrency, retries, caching, and metrics.
 ///
-/// Clones share the driver session, prepared-statement cache, concurrency
-/// semaphore, and process-global metrics.
-///
-/// The `table` and `query_tag` arguments become Prometheus labels. Use stable,
-/// bounded values rather than record identifiers or other unbounded input.
+/// Prepared methods infer table labels from driver metadata. Query callers must
+/// be stable and bounded because they are exported as Prometheus labels.
 #[derive(Clone)]
 pub struct ScyllaClient {
     inner: Arc<Inner>,
@@ -58,31 +48,25 @@ pub struct ScyllaClient {
 }
 
 impl ScyllaClient {
-    /// Validate configuration, initialize metrics, and connect to ScyllaDB.
-    ///
-    /// The driver uses LZ4 compression, `LocalQuorum` consistency, and the
-    /// configured request timeout.
+    /// Validate configuration and connect to ScyllaDB.
     ///
     /// # Errors
     ///
     /// Returns [`ScyllaClientError::InvalidConfig`] for invalid configuration,
-    /// [`ScyllaClientError::Metrics`] when metric registration fails,
     /// or [`ScyllaClientError::Connect`] when the driver session cannot be
     /// established.
     pub async fn new(config: &ScyllaClientConfig) -> ScyllaClientResult<Self> {
         let endpoints = validate_config(config)?;
-        let metrics = ScyllaClientMetrics::initialize()?;
-        let inner = Inner::new(config, &endpoints, metrics).await?;
+        let inner = Inner::new(config, &endpoints).await?;
         Ok(Self {
             inner: Arc::new(inner),
             retry_config: config.retry,
         })
     }
 
-    /// Execute a prepared query and deserialize all returned rows.
+    /// Execute a retried prepared query and deserialize all rows.
     ///
-    /// Failed preparation, execution, or row decoding is retried according to
-    /// the client configuration.
+    /// `caller` is a stable, bounded metrics label.
     ///
     /// # Errors
     ///
@@ -90,23 +74,21 @@ impl ScyllaClient {
     /// [`ScyllaClientError::Query`] after retry attempts are exhausted.
     pub async fn select<R: DeserRow>(
         &self,
-        table: &str,
         query: impl Into<Statement> + Clone,
         values: impl SerializeRow + Clone,
-        query_tag: Option<&str>,
+        caller: &'static str,
     ) -> ScyllaClientResult<Vec<R>> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT);
         execute_with_retry(&self.retry_config, || {
-            self.inner
-                .select(table, query.clone(), values.clone(), query_tag)
+            self.inner.select(query.clone(), values.clone(), caller)
         })
         .await
+        .map(|selected| selected.rows)
     }
 
-    /// Execute a prepared query that must return zero or one row.
+    /// Execute a retried prepared query returning at most one row.
     ///
-    /// Failed database work is retried. A successful query that returns more
-    /// than one row produces a non-retried [`ScyllaClientError::Query`].
+    /// Cardinality errors are not retried. `caller` is a stable, bounded metrics
+    /// label.
     ///
     /// # Errors
     ///
@@ -115,21 +97,22 @@ impl ScyllaClient {
     /// failures.
     pub async fn select_one<R: DeserRow>(
         &self,
-        table: &str,
         query: impl Into<Statement> + Clone,
         values: impl SerializeRow + Clone,
-        query_tag: Option<&str>,
+        caller: &'static str,
     ) -> ScyllaClientResult<Option<R>> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_ONE);
-        let rows = execute_with_retry(&self.retry_config, || {
+        let selected = execute_with_retry(&self.retry_config, || {
             self.inner
-                .select::<R>(table, query.clone(), values.clone(), query_tag)
+                .select::<R>(query.clone(), values.clone(), caller)
         })
         .await?;
-        into_optional_single(table, query_tag, rows)
+        let table = prepared_row_table(&selected.prepared);
+        into_optional_single(&table, caller, selected.rows)
     }
 
-    /// Execute a prepared query and return dynamically typed driver rows.
+    /// Execute a retried prepared query and return dynamically typed rows.
+    ///
+    /// `caller` is a stable, bounded metrics label.
     ///
     /// # Errors
     ///
@@ -137,23 +120,21 @@ impl ScyllaClient {
     /// [`ScyllaClientError::Query`] after retry attempts are exhausted.
     pub async fn select_row(
         &self,
-        table: &str,
         query: impl Into<Statement> + Clone,
         values: impl SerializeRow + Clone,
-        query_tag: Option<&str>,
+        caller: &'static str,
     ) -> ScyllaClientResult<Vec<Row>> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_ROW);
         execute_with_retry(&self.retry_config, || {
-            self.inner
-                .select(table, query.clone(), values.clone(), query_tag)
+            self.inner.select(query.clone(), values.clone(), caller)
         })
         .await
+        .map(|selected| selected.rows)
     }
 
     /// Execute one page of a prepared query.
     ///
-    /// The returned [`ControlFlow`] breaks when paging is complete and
-    /// continues with the state required for the next page.
+    /// [`ControlFlow`] breaks at completion or continues with the next paging
+    /// state. `caller` is a stable, bounded metrics label.
     ///
     /// # Errors
     ///
@@ -161,29 +142,22 @@ impl ScyllaClient {
     /// [`ScyllaClientError::Query`] after retry attempts are exhausted.
     pub async fn select_page<R: DeserRow>(
         &self,
-        table: &str,
         query: impl Into<Statement> + Clone,
         values: impl SerializeRow + Clone,
         paging_state: PagingState,
-        query_tag: Option<&str>,
+        caller: &'static str,
     ) -> ScyllaClientResult<(Vec<R>, ControlFlow<(), PagingState>)> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_SELECT_PAGE);
         execute_with_retry(&self.retry_config, || {
-            self.inner.select_page(
-                table,
-                query.clone(),
-                values.clone(),
-                paging_state.clone(),
-                query_tag,
-            )
+            self.inner
+                .select_page(query.clone(), values.clone(), paging_state.clone(), caller)
         })
         .await
     }
 
-    /// Execute a prepared insert statement.
+    /// Execute a retried prepared insert.
     ///
-    /// The statement is marked idempotent and may be attempted more than once.
-    /// Only use this method for writes that are safe to replay.
+    /// The statement must be safe to replay. `caller` is a stable, bounded
+    /// metrics label.
     ///
     /// # Errors
     ///
@@ -191,23 +165,21 @@ impl ScyllaClient {
     /// [`ScyllaClientError::Query`] after retry attempts are exhausted.
     pub async fn insert(
         &self,
-        table: &str,
         query: impl Into<Statement> + Clone,
         values: impl SerializeRow + Clone,
-        query_tag: Option<&str>,
+        caller: &'static str,
     ) -> ScyllaClientResult<()> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_INSERT);
         execute_with_retry(&self.retry_config, || {
             self.inner
-                .query(table, query.clone(), values.clone(), Insert, query_tag)
+                .query(query.clone(), values.clone(), Insert, caller)
         })
         .await
     }
 
-    /// Execute a prepared delete statement.
+    /// Execute a retried prepared delete.
     ///
-    /// The statement is marked idempotent and may be attempted more than once.
-    /// Only use this method for writes that are safe to replay.
+    /// The statement must be safe to replay. `caller` is a stable, bounded
+    /// metrics label.
     ///
     /// # Errors
     ///
@@ -215,23 +187,20 @@ impl ScyllaClient {
     /// [`ScyllaClientError::Query`] after retry attempts are exhausted.
     pub async fn delete(
         &self,
-        table: &str,
         query: impl Into<Statement> + Clone,
         values: impl SerializeRow + Clone,
-        query_tag: Option<&str>,
+        caller: &'static str,
     ) -> ScyllaClientResult<()> {
-        let query_tag = query_tag.unwrap_or(QUERY_TAG_DEFAULT_DELETE);
         execute_with_retry(&self.retry_config, || {
             self.inner
-                .query(table, query.clone(), values.clone(), Delete, query_tag)
+                .query(query.clone(), values.clone(), Delete, caller)
         })
         .await
     }
 
-    /// Select the configured keyspace for this driver session.
+    /// Select the configured keyspace.
     ///
-    /// The generated unprepared statement is safe because construction
-    /// validates the keyspace as an unquoted CQL identifier.
+    /// Construction validates the interpolated keyspace as a CQL identifier.
     ///
     /// # Errors
     ///
@@ -239,22 +208,28 @@ impl ScyllaClient {
     /// exhausted.
     pub async fn use_keyspace(&self) -> ScyllaClientResult<()> {
         let query = format!("USE {}", self.inner.keyspace.name);
-        execute_with_retry(&self.retry_config, || self.execute_unprepared(&query)).await
+        execute_with_retry(&self.retry_config, || {
+            self.execute_unprepared(&query, "use_keyspace")
+        })
+        .await
     }
 
     /// Execute raw CQL without preparing it.
     ///
-    /// This method performs one attempt and is intended for statements that
-    /// the driver cannot prepare, such as `USE` and schema migrations. It does
-    /// not validate or quote CQL. Never interpolate untrusted input.
+    /// Performs one attempt without validating or quoting CQL. Never
+    /// interpolate untrusted input. `caller` is a stable, bounded metrics label.
     ///
     /// # Errors
     ///
     /// Returns [`ScyllaClientError::Query`] when the concurrency permit cannot
     /// be acquired or the driver rejects the statement.
-    pub async fn execute_unprepared(&self, query: &str) -> ScyllaClientResult<()> {
+    pub async fn execute_unprepared(
+        &self,
+        query: &str,
+        caller: &'static str,
+    ) -> ScyllaClientResult<()> {
         self.inner
-            .execute_unprepared("execute(no_table)", query)
+            .execute_unprepared("execute_no_table", query, caller)
             .await
     }
 
@@ -277,7 +252,7 @@ where
 
 fn into_optional_single<T>(
     table: &str,
-    query_tag: &str,
+    caller: &str,
     rows: Vec<T>,
 ) -> ScyllaClientResult<Option<T>> {
     match rows.len() {
@@ -286,25 +261,25 @@ fn into_optional_single<T>(
         count => Err(ScyllaClientError::query(
             "select",
             table,
-            query_tag,
+            caller,
             std::io::Error::other(format!("expected at most one row, received {count}")),
         )),
     }
+}
+
+struct SelectedRows<T> {
+    rows: Vec<T>,
+    prepared: PreparedStatement,
 }
 
 struct Inner {
     session: CachingSession,
     keyspace: KeyspaceConfig,
     active_queries: Semaphore,
-    metrics: &'static ScyllaClientMetrics,
 }
 
 impl Inner {
-    async fn new(
-        config: &ScyllaClientConfig,
-        endpoints: &[&str],
-        metrics: &'static ScyllaClientMetrics,
-    ) -> ScyllaClientResult<Self> {
+    async fn new(config: &ScyllaClientConfig, endpoints: &[&str]) -> ScyllaClientResult<Self> {
         let profile = ExecutionProfile::builder()
             .request_timeout(Some(config.request_timeout))
             .consistency(scylla::statement::Consistency::LocalQuorum)
@@ -327,52 +302,45 @@ impl Inner {
             session: CachingSessionBuilder::new(session).build(),
             keyspace: config.keyspace.clone(),
             active_queries: Semaphore::new(config.max_parallel_queries),
-            metrics,
         })
     }
 
-    async fn execute_unprepared(&self, table: &str, query: &str) -> ScyllaClientResult<()> {
+    async fn execute_unprepared(
+        &self,
+        table: &str,
+        query: &str,
+        caller: &str,
+    ) -> ScyllaClientResult<()> {
         let start_time = Instant::now();
         let _active_query = self
-            .acquire_query_permit(table, Execute, QUERY_TAG_DEFAULT_QUERY_ERROR, start_time)
+            .acquire_query_permit(Execute, caller, start_time)
             .await?;
 
         log::trace!("Executing unprepared query: {query:?}");
         match self.session.get_session().query_unpaged(query, &()).await {
             Ok(_) => {
-                self.metrics.update_success(
-                    table,
-                    Execute,
-                    start_time.elapsed(),
-                    QUERY_TAG_DEFAULT_EXECUTE_SUCCESS,
-                );
+                ScyllaClientMetrics::update_success(table, Execute, start_time.elapsed(), caller);
                 Ok(())
             }
-            Err(error) => Err(self.query_error(
-                table,
-                Execute,
-                error,
-                start_time.elapsed(),
-                QUERY_TAG_DEFAULT_QUERY_ERROR,
-            )),
+            Err(error) => {
+                Err(self.query_error(table, Execute, error, start_time.elapsed(), caller))
+            }
         }
     }
 
     async fn query(
         &self,
-        table: &str,
         query: impl Into<Statement>,
         values: impl SerializeRow,
         query_type: QueryType,
-        query_tag: &str,
+        caller: &str,
     ) -> ScyllaClientResult<()> {
         let start_time = Instant::now();
         let _active_query = self
-            .acquire_query_permit(table, query_type, query_tag, start_time)
+            .acquire_query_permit(query_type, caller, start_time)
             .await?;
-        let prepared_query = self
-            .prepare_query(table, query, query_type, query_tag)
-            .await?;
+        let prepared_query = self.prepare_query(query, query_type, caller).await?;
+        let table = prepared_table(&prepared_query);
 
         log::trace!("Executing prepared query: {prepared_query:?}");
         match self
@@ -382,69 +350,76 @@ impl Inner {
             .await
         {
             Ok(_) => {
-                self.metrics
-                    .update_success(table, query_type, start_time.elapsed(), query_tag);
+                ScyllaClientMetrics::update_success(
+                    &table,
+                    query_type,
+                    start_time.elapsed(),
+                    caller,
+                );
                 Ok(())
             }
             Err(error) => {
-                Err(self.query_error(table, query_type, error, start_time.elapsed(), query_tag))
+                Err(self.query_error(&table, query_type, error, start_time.elapsed(), caller))
             }
         }
     }
 
     async fn select<R: DeserRow>(
         &self,
-        table: &str,
         query: impl Into<Statement>,
         values: impl SerializeRow,
-        query_tag: &str,
-    ) -> ScyllaClientResult<Vec<R>> {
+        caller: &str,
+    ) -> ScyllaClientResult<SelectedRows<R>> {
         let start_time = Instant::now();
         let _active_query = self
-            .acquire_query_permit(table, Select, query_tag, start_time)
+            .acquire_query_permit(Select, caller, start_time)
             .await?;
 
-        let prepared_query = self.prepare_query(table, query, Select, query_tag).await?;
+        let prepared_query = self.prepare_query(query, Select, caller).await?;
+        let table = prepared_row_table(&prepared_query);
         log::trace!("Executing prepared query: {prepared_query:?}");
 
         let query_result = self
             .session
             .get_session()
-            .execute_iter(prepared_query, values)
+            .execute_iter(prepared_query.clone(), values)
             .await
             .map_err(|error| {
-                self.query_error(table, Select, error, start_time.elapsed(), query_tag)
+                self.query_error(&table, Select, error, start_time.elapsed(), caller)
             })?;
 
         let mut result = Vec::new();
         let mut rows_stream = query_result.rows_stream().map_err(|error| {
-            self.query_error(table, Select, error, start_time.elapsed(), query_tag)
+            self.query_error(&table, Select, error, start_time.elapsed(), caller)
         })?;
         while let Some(row) = rows_stream.next().await {
             result.push(row.map_err(|error| {
-                self.query_error(table, Select, error, start_time.elapsed(), query_tag)
+                self.query_error(&table, Select, error, start_time.elapsed(), caller)
             })?);
         }
 
-        self.metrics
-            .update_success(table, Select, start_time.elapsed(), query_tag);
-        Ok(result)
+        ScyllaClientMetrics::update_success(&table, Select, start_time.elapsed(), caller);
+        drop(table);
+        Ok(SelectedRows {
+            rows: result,
+            prepared: prepared_query,
+        })
     }
 
     async fn select_page<R: DeserRow>(
         &self,
-        table: &str,
         query: impl Into<Statement>,
         values: impl SerializeRow,
         paging_state: PagingState,
-        query_tag: &str,
+        caller: &str,
     ) -> ScyllaClientResult<(Vec<R>, ControlFlow<(), PagingState>)> {
         let start_time = Instant::now();
         let _active_query = self
-            .acquire_query_permit(table, Select, query_tag, start_time)
+            .acquire_query_permit(Select, caller, start_time)
             .await?;
 
-        let prepared_query = self.prepare_query(table, query, Select, query_tag).await?;
+        let prepared_query = self.prepare_query(query, Select, caller).await?;
+        let table = prepared_row_table(&prepared_query);
         log::trace!("Executing prepared query: {prepared_query:?}");
 
         let (query_result, paging_state_response) = self
@@ -453,29 +428,27 @@ impl Inner {
             .execute_single_page(&prepared_query, values, paging_state)
             .await
             .map_err(|error| {
-                self.query_error(table, Select, error, start_time.elapsed(), query_tag)
+                self.query_error(&table, Select, error, start_time.elapsed(), caller)
             })?;
 
         let elapsed = start_time.elapsed();
         let rows = query_result
             .into_rows_result()
-            .map_err(|error| self.query_error(table, Select, error, elapsed, query_tag))?
+            .map_err(|error| self.query_error(&table, Select, error, elapsed, caller))?
             .rows::<R>()
-            .map_err(|error| self.query_error(table, Select, error, elapsed, query_tag))?
+            .map_err(|error| self.query_error(&table, Select, error, elapsed, caller))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| self.query_error(table, Select, error, elapsed, query_tag))?;
+            .map_err(|error| self.query_error(&table, Select, error, elapsed, caller))?;
 
-        self.metrics
-            .update_success(table, Select, elapsed, query_tag);
+        ScyllaClientMetrics::update_success(&table, Select, elapsed, caller);
         Ok((rows, paging_state_response.into_paging_control_flow()))
     }
 
     async fn prepare_query(
         &self,
-        table: &str,
         query: impl Into<Statement>,
         query_type: QueryType,
-        query_tag: &str,
+        caller: &str,
     ) -> ScyllaClientResult<PreparedStatement> {
         let query = query.into();
         log::trace!("Preparing query: {}", query.contents);
@@ -485,7 +458,7 @@ impl Inner {
                 .await
                 .map_err(|error| {
                     let operation: &str = query_type.into();
-                    ScyllaClientError::prepare(operation, table, query_tag, error)
+                    ScyllaClientError::prepare(operation, TABLE_UNKNOWN, caller, error)
                 })?;
         let mut prepared_statement = prepared_statement;
         prepared_statement.set_retry_policy(Some(Arc::new(FallthroughRetryPolicy::new())));
@@ -495,15 +468,20 @@ impl Inner {
 
     async fn acquire_query_permit(
         &self,
-        table: &str,
         query_type: QueryType,
-        query_tag: &str,
+        caller: &str,
         start_time: Instant,
     ) -> ScyllaClientResult<SemaphorePermit<'_>> {
         let permit = self.active_queries.acquire().await.map_err(|error| {
-            self.query_error(table, query_type, error, start_time.elapsed(), query_tag)
+            self.query_error(
+                TABLE_UNKNOWN,
+                query_type,
+                error,
+                start_time.elapsed(),
+                caller,
+            )
         })?;
-        self.metrics.update_wait_connection(start_time.elapsed());
+        ScyllaClientMetrics::update_wait_connection(start_time.elapsed());
         Ok(permit)
     }
 
@@ -513,16 +491,38 @@ impl Inner {
         query_type: QueryType,
         source: impl Error + Send + Sync + 'static,
         duration: Duration,
-        query_tag: &str,
+        caller: &str,
     ) -> ScyllaClientError {
         let operation: &str = query_type.into();
         log::warn!(
-            "Scylla query error: table={table}, operation={operation}, query_tag={query_tag}, error={source}"
+            "Scylla query error: table={table}, operation={operation}, caller={caller}, error={source}"
         );
-        self.metrics
-            .update_error(table, query_type, duration, query_tag);
-        ScyllaClientError::query(operation, table, query_tag, source)
+        ScyllaClientMetrics::update_error(table, query_type, duration, caller);
+        ScyllaClientError::query(operation, table, caller, source)
     }
+}
+
+fn prepared_table(prepared: &PreparedStatement) -> Cow<'_, str> {
+    if let Some(table) = prepared.get_table_name().filter(|table| !table.is_empty()) {
+        return Cow::Borrowed(table);
+    }
+
+    Cow::Borrowed(TABLE_UNKNOWN)
+}
+
+fn prepared_row_table(prepared: &PreparedStatement) -> Cow<'_, str> {
+    if let Some(table) = prepared.get_table_name().filter(|table| !table.is_empty()) {
+        return Cow::Borrowed(table);
+    }
+
+    prepared
+        .get_current_result_set_col_specs()
+        .get()
+        .get_by_index(0)
+        .map(|column| column.table_spec().table_name())
+        .filter(|table| !table.is_empty())
+        .map(|table| Cow::Owned(table.to_owned()))
+        .unwrap_or(Cow::Borrowed(TABLE_UNKNOWN))
 }
 
 #[cfg(test)]
@@ -560,12 +560,12 @@ mod tests {
     #[test]
     fn test_into_optional_single_enforces_cardinality() -> anyhow::Result<()> {
         assert_eq!(
-            into_optional_single::<u8>("table", "tag", Vec::new())?,
+            into_optional_single::<u8>("table", "caller", Vec::new())?,
             None
         );
-        assert_eq!(into_optional_single("table", "tag", vec![7])?, Some(7));
+        assert_eq!(into_optional_single("table", "caller", vec![7])?, Some(7));
 
-        let error = into_optional_single("table", "tag", vec![7, 8]);
+        let error = into_optional_single("table", "caller", vec![7, 8]);
         assert!(matches!(error, Err(ScyllaClientError::Query { .. })));
         Ok(())
     }

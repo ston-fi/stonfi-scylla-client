@@ -17,13 +17,6 @@ pub enum ScyllaClientError {
         /// Human-readable invariant that was violated.
         reason: String,
     },
-    /// Prometheus metric registration failed.
-    #[error("failed to initialize Scylla client metrics")]
-    Metrics {
-        /// Underlying registration failure.
-        #[source]
-        source: Box<dyn Error + Send + Sync + 'static>,
-    },
     /// Establishing the driver session failed.
     #[error("failed to connect to ScyllaDB")]
     Connect {
@@ -32,27 +25,27 @@ pub enum ScyllaClientError {
         source: Box<dyn Error + Send + Sync + 'static>,
     },
     /// Preparing a CQL statement failed.
-    #[error("failed to prepare {operation} query for table `{table}` (tag `{query_tag}`)")]
+    #[error("failed to prepare {operation} query for table `{table}` (caller `{caller}`)")]
     Prepare {
         /// High-level query operation.
         operation: &'static str,
-        /// Logical table label supplied for metrics and diagnostics.
+        /// Physical table inferred from prepared metadata, or `unknown`.
         table: String,
-        /// Query tag supplied for metrics and diagnostics.
-        query_tag: String,
+        /// Stable caller name supplied for metrics and diagnostics.
+        caller: String,
         /// Underlying driver failure.
         #[source]
         source: Box<dyn Error + Send + Sync + 'static>,
     },
     /// Executing or decoding a CQL query failed.
-    #[error("{operation} query failed for table `{table}` (tag `{query_tag}`)")]
+    #[error("{operation} query failed for table `{table}` (caller `{caller}`)")]
     Query {
         /// High-level query operation.
         operation: &'static str,
-        /// Logical table label supplied for metrics and diagnostics.
+        /// Table inferred from prepared metadata or assigned by an unprepared operation.
         table: String,
-        /// Query tag supplied for metrics and diagnostics.
-        query_tag: String,
+        /// Stable caller name supplied for metrics and diagnostics.
+        caller: String,
         /// Underlying driver or decoding failure.
         #[source]
         source: Box<dyn Error + Send + Sync + 'static>,
@@ -78,12 +71,6 @@ impl ScyllaClientError {
         }
     }
 
-    pub(crate) fn metrics(source: anyhow::Error) -> Self {
-        Self::Metrics {
-            source: source.into_boxed_dyn_error(),
-        }
-    }
-
     pub(crate) fn connect(source: impl Error + Send + Sync + 'static) -> Self {
         Self::Connect {
             source: Box::new(source),
@@ -93,13 +80,13 @@ impl ScyllaClientError {
     pub(crate) fn prepare(
         operation: &'static str,
         table: &str,
-        query_tag: &str,
+        caller: &str,
         source: impl Error + Send + Sync + 'static,
     ) -> Self {
         Self::Prepare {
             operation,
             table: table.to_owned(),
-            query_tag: query_tag.to_owned(),
+            caller: caller.to_owned(),
             source: Box::new(source),
         }
     }
@@ -107,13 +94,13 @@ impl ScyllaClientError {
     pub(crate) fn query(
         operation: &'static str,
         table: &str,
-        query_tag: &str,
+        caller: &str,
         source: impl Error + Send + Sync + 'static,
     ) -> Self {
         Self::Query {
             operation,
             table: table.to_owned(),
-            query_tag: query_tag.to_owned(),
+            caller: caller.to_owned(),
             source: Box::new(source),
         }
     }

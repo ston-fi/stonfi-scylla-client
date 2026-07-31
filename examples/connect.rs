@@ -27,10 +27,9 @@ async fn main() -> anyhow::Result<()> {
     client.use_keyspace().await?;
     let rows = client
         .select_row(
-            "system.local",
             "SELECT cluster_name FROM system.local",
             (),
-            Some("example_cluster_name"),
+            "example_cluster_name",
         )
         .await?;
 

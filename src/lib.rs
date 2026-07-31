@@ -4,10 +4,8 @@
 //! retry policy, prepared-statement caching, Prometheus metrics, and a
 //! deliberately small CQL migration helper.
 //!
-//! Applications should initialize [`stonfi_metrics`] during startup, then
-//! construct [`client::ScyllaClient`] from a [`config::ScyllaClientConfig`].
-//! Client construction also initializes this crate's metrics, so construction
-//! remains safe when application-level metrics initialization happens later.
+//! Construct [`client::ScyllaClient`] from a
+//! [`config::ScyllaClientConfig`].
 //!
 //! # Example
 //!

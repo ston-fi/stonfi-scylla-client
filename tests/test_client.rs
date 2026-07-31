@@ -37,6 +37,8 @@ struct TestObject {
 
 #[tokio::test]
 async fn test_client_end_to_end() -> anyhow::Result<()> {
+    stonfi_metrics::init_metrics!()?;
+
     let port_reservation = TcpListener::bind(("127.0.0.1", 0))?;
     let listening_port = port_reservation.local_addr()?.port();
     drop(port_reservation);
@@ -92,10 +94,12 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
         .apply_all(&[CREATE_KEYSPACE_QUERY.to_owned()])
         .await?;
     client.use_keyspace().await?;
-    client.execute_unprepared(CREATE_TABLE_QUERY).await?;
+    client
+        .execute_unprepared(CREATE_TABLE_QUERY, "create_test_object")
+        .await?;
 
     let keyspaces = client
-        .select_row("", "DESCRIBE KEYSPACES", (), None)
+        .select_row("DESCRIBE KEYSPACES", (), "describe_keyspaces")
         .await?;
     assert!(keyspaces.iter().any(|row| {
         row.columns[0]
@@ -105,7 +109,7 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     }));
 
     let empty = client
-        .select::<TestObject>("test_object", "SELECT * FROM test_object", (), None)
+        .select::<TestObject>("SELECT * FROM test_object", (), "select_empty_test_objects")
         .await?;
     assert!(empty.is_empty());
 
@@ -120,46 +124,62 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     for object in [&first, &second] {
         client
             .insert(
-                "test_object",
                 "INSERT INTO test_object (field1, field2) VALUES (?, ?)",
                 object.clone(),
-                Some("insert_test_object"),
+                "insert_test_object",
             )
             .await?;
     }
 
+    let invalid_insert = client
+        .insert(
+            "INSERT INTO test_object (field1, field2) VALUES (?, ?)",
+            ("invalid-int", "invalid"),
+            "insert_invalid_test_object",
+        )
+        .await;
+    assert!(matches!(
+        invalid_insert,
+        Err(ScyllaClientError::Query {
+            table,
+            caller,
+            ..
+        }) if table == "test_object" && caller == "insert_invalid_test_object"
+    ));
+
     let selected = client
         .select_one::<TestObject>(
-            "test_object",
             "SELECT * FROM test_object WHERE field1 = ?",
             (1,),
-            Some("select_test_object"),
+            "select_test_object",
         )
         .await?;
     assert_eq!(selected, Some(first.clone()));
 
     let cardinality_error = client
-        .select_one::<TestObject>("test_object", "SELECT * FROM test_object", (), None)
+        .select_one::<TestObject>("SELECT * FROM test_object", (), "select_many_as_one")
         .await;
     assert!(matches!(
         cardinality_error,
-        Err(ScyllaClientError::Query { .. })
+        Err(ScyllaClientError::Query {
+            table,
+            caller,
+            ..
+        }) if table == "test_object" && caller == "select_many_as_one"
     ));
 
     client
         .delete(
-            "test_object",
             "DELETE FROM test_object WHERE field1 = ?",
             (1,),
-            Some("delete_test_object"),
+            "delete_test_object",
         )
         .await?;
     let deleted = client
         .select_one::<TestObject>(
-            "test_object",
             "SELECT * FROM test_object WHERE field1 = ?",
             (1,),
-            None,
+            "select_deleted_test_object",
         )
         .await?;
     assert_eq!(deleted, None);
@@ -167,13 +187,12 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     for field1 in 3..=50 {
         client
             .insert(
-                "test_object",
                 "INSERT INTO test_object (field1, field2) VALUES (?, ?)",
                 TestObject {
                     field1,
                     field2: format!("value-{field1}"),
                 },
-                None,
+                "insert_paged_test_object",
             )
             .await?;
     }
@@ -183,11 +202,10 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
             .with_page_size(7);
     let (small_page, _) = client
         .select_page::<TestObject>(
-            "test_object",
             query_with_small_page,
             (50,),
             PagingState::start(),
-            Some("small_page_test_objects"),
+            "small_page_test_objects",
         )
         .await?;
     assert_eq!(small_page.len(), 7);
@@ -200,11 +218,10 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     loop {
         let (rows, control_flow) = client
             .select_page::<TestObject>(
-                "test_object",
                 query.clone(),
                 (50,),
                 paging_state.clone(),
-                Some("page_test_objects"),
+                "page_test_objects",
             )
             .await?;
         paged_rows.extend(rows);
@@ -218,16 +235,21 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     assert!(paged_rows.contains(&second));
 
     let query_error = client
-        .select_row(
-            "missing_table",
-            "SELECT * FROM missing_table",
-            (),
-            Some("expected_failure"),
-        )
+        .select_row("SELECT * FROM missing_table", (), "select_missing_table")
         .await;
     assert!(matches!(
         query_error,
-        Err(ScyllaClientError::Prepare { .. } | ScyllaClientError::Query { .. })
+        Err(
+            ScyllaClientError::Prepare {
+                table,
+                caller,
+                ..
+            } | ScyllaClientError::Query {
+                table,
+                caller,
+                ..
+            }
+        ) if table == "unknown" && caller == "select_missing_table"
     ));
 
     Ok(())
@@ -240,7 +262,7 @@ async fn wait_for_scylla(
     let mut last_error = None;
     for _ in 0..30 {
         match client
-            .execute_unprepared("SELECT now() FROM system.local")
+            .execute_unprepared("SELECT now() FROM system.local", "wait_for_scylla")
             .await
         {
             Ok(()) => return Ok(()),

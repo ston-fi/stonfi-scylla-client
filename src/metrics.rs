@@ -5,7 +5,6 @@ use stonfi_metrics::constants::DURATION_BUCKETS_01MS_20S;
 use stonfi_metrics::prometheus::{self, Histogram, HistogramVec, IntCounterVec};
 use stonfi_metrics::utils::format_duration_ms;
 
-use crate::errors::{ScyllaClientError, ScyllaClientResult};
 use crate::types::QueryType;
 
 static METRICS: MetricsCell<ScyllaClientMetrics> = MetricsCell::new();
@@ -19,20 +18,8 @@ pub(crate) struct ScyllaClientMetrics {
 }
 
 impl ScyllaClientMetrics {
-    pub(crate) fn initialize() -> ScyllaClientResult<&'static Self> {
-        METRICS
-            .init("stonfi_scylla_client::ScyllaClientMetrics", Self::new)
-            .map_err(ScyllaClientError::metrics)?;
-        METRICS.get().ok_or_else(|| {
-            ScyllaClientError::metrics(
-                std::io::Error::other("Scylla metrics initialization completed without metrics")
-                    .into(),
-            )
-        })
-    }
-
     fn new() -> anyhow::Result<Self> {
-        let labels = &["table_name", "query_type", "status", "query_tag"];
+        let labels = &["table_name", "query_type", "status", "caller"];
 
         Ok(Self {
             db_scylla_queries: prometheus::register_int_counter_vec!(
@@ -55,44 +42,46 @@ impl ScyllaClientMetrics {
     }
 
     pub(crate) fn update_success(
-        &self,
         table: &str,
         query_type: QueryType,
         duration: Duration,
-        query_tag: &str,
+        caller: &str,
     ) {
-        self.update(table, query_type, duration, true, query_tag);
+        Self::update(table, query_type, duration, true, caller);
     }
 
     pub(crate) fn update_error(
-        &self,
         table: &str,
         query_type: QueryType,
         duration: Duration,
-        query_tag: &str,
+        caller: &str,
     ) {
-        self.update(table, query_type, duration, false, query_tag);
+        Self::update(table, query_type, duration, false, caller);
     }
 
-    pub(crate) fn update_wait_connection(&self, duration: Duration) {
-        self.db_scylla_wait_connection_ms
+    pub(crate) fn update_wait_connection(duration: Duration) {
+        METRICS
+            .db_scylla_wait_connection_ms
             .observe(format_duration_ms(duration));
     }
 
     fn update(
-        &self,
         table_name: &str,
         query_type: QueryType,
         duration: Duration,
         is_ok: bool,
-        query_tag: &str,
+        caller: &str,
     ) {
         let status = if is_ok { "ok" } else { "error" };
         let query_type: &str = query_type.into();
-        let label_values = &[table_name, query_type, status, query_tag];
+        let label_values = &[table_name, query_type, status, caller];
 
-        self.db_scylla_queries.with_label_values(label_values).inc();
-        self.db_scylla_queries_duration_ms
+        METRICS
+            .db_scylla_queries
+            .with_label_values(label_values)
+            .inc();
+        METRICS
+            .db_scylla_queries_duration_ms
             .with_label_values(label_values)
             .observe(format_duration_ms(duration));
     }

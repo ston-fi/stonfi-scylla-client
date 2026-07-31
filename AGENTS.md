@@ -37,10 +37,9 @@ Applications should:
 3. call `ScyllaClient::new(&config).await`; and
 4. call `use_keyspace()` only after the keyspace exists.
 
-`ScyllaClient::new` validates configuration and initializes this crate's global
-metrics before connecting. Clones share the session, prepared statements,
-semaphore, and metrics. The crate requires Tokio but does not spawn or own
-background tasks.
+`ScyllaClient::new` validates configuration before connecting. Clones share the
+session, prepared statements, and semaphore. The crate requires Tokio but does
+not spawn or own background tasks.
 
 The public configuration fields are an intentional serialization and
 struct-literal contract. Preserve their names and types unless a versioned
@@ -55,6 +54,13 @@ validation at construction rather than silently normalizing invalid values.
 
 - Prefer prepared methods for data queries. Use `execute_unprepared` only for
   statements such as `USE` and schema migrations.
+- Prepared methods infer their physical table from server-provided bind
+  metadata; row queries also fall back to result metadata. Use `unknown` when
+  preparation fails or no table metadata exists; do not parse CQL to recover
+  it. Queries must target a bounded set of physical table names because the
+  inferred name is a metric label.
+- Every prepared method and public `execute_unprepared` call requires a stable,
+  bounded `caller` metric label. Internal callers are fixed names.
 - Preserve per-statement configuration through the upstream driver's
   `CachingSession`, except for statement-level retry policies, which the client
   overrides so `RetryConfig` remains the sole retry owner. Do not add a second
@@ -66,8 +72,9 @@ validation at construction rather than silently normalizing invalid values.
   add a new non-exhaustive error category only when callers need to distinguish
   it.
 - Keep metric names and labels stable. Dashboards depend on
-  `db_scylla_queries`, `db_scylla_queries_duration_ms`, and
-  `db_scylla_wait_connection_ms`.
+  `db_scylla_queries`, `db_scylla_queries_duration_ms`,
+  `db_scylla_wait_connection_ms`, and the `table_name`, `query_type`, `status`,
+  and `caller` query labels.
 - Do not test Prometheus registration, label names, or increments. Test the
   project behavior that drives metrics instead.
 - The old commons client owns the same metric names. Consumers must migrate
@@ -104,6 +111,8 @@ authorization.
 - Do not add an `execute` alias beside `execute_unprepared`.
 - Do not make retry behavior implicit for new operations; document whether and
   why they are retried.
+- Do not reintroduce caller-supplied table labels or optional prepared-query
+  callers.
 - Do not expose internal metric handles, retry state, sessions, semaphores, or
   prepared-statement caches.
 - Do not silently skip Docker integration tests when Scylla is unavailable.

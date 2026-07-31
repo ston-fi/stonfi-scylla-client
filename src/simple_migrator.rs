@@ -50,7 +50,9 @@ impl SimpleMigrator {
     pub async fn apply(&self, query_template: &str) -> ScyllaClientResult<()> {
         let query = render_statement(query_template, &self.config);
         log::trace!("Executing migration statement: {query}");
-        self.client.execute_unprepared(&query).await
+        self.client
+            .execute_unprepared(&query, "simple_migrator")
+            .await
     }
 
     /// Split CQL source into statements.

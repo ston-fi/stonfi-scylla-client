@@ -55,10 +55,9 @@ client.use_keyspace().await?;
 
 let rows = client
     .select_row(
-        "system.local",
         "SELECT cluster_name FROM system.local",
         (),
-        Some("read_cluster_name"),
+        "read_cluster_name",
     )
     .await?;
 
@@ -76,12 +75,16 @@ inside it, use `RetryConfig::default()`.
 
 - `select`, `select_one`, `select_row`, `select_page`, `insert`, and
   `delete` use prepared statements and the configured retry policy.
+- Prepared operations infer their physical table from server-provided bind
+  metadata; row queries also fall back to result metadata. Operations without
+  table metadata use `unknown`.
+- Every prepared operation requires a stable `caller` metrics label.
 - Prepared statements are marked idempotent. Write queries supplied to
   `insert` and `delete` must therefore be safe to replay.
 - The configured exponential retry policy is the sole retry mechanism;
   statement-level driver retry policies are ignored.
-- `execute_unprepared` performs one attempt. It is intended for `USE` and
-  schema migrations and must never interpolate untrusted input.
+- `execute_unprepared` requires a stable `caller` and performs one attempt. It
+  is intended for schema operations and must never interpolate untrusted input.
 - Cloned clients share a session, prepared-statement cache, concurrency limit,
   and process-global metrics.
 - `select_one` returns an error when a successful query produces more than one
@@ -100,12 +103,15 @@ The crate registers these metrics in the default Prometheus registry:
 - `db_scylla_wait_connection_ms`
 
 Query counters and durations use `table_name`, `query_type`, `status`, and
-`query_tag` labels. `ScyllaClient::new` initializes the metrics fallibly, and
-normal applications should also initialize `stonfi_metrics` during startup to
-serve the global registry.
+`caller` labels. Applications must initialize `stonfi_metrics` before executing
+queries; client construction does not own the metrics lifecycle.
 
-Use stable, bounded `table` and `query_tag` values. Record identifiers, request
-IDs, and other unbounded values create excessive Prometheus label cardinality.
+Prepared statements normally derive `table_name` from bind-variable metadata.
+Parameterless row queries fall back to result metadata; preparation failures
+and statements without table metadata use `unknown`. The required `caller`
+argument supplies the `caller` label. Use stable, bounded caller names rather
+than record identifiers or request IDs. Queries must also target a bounded set
+of physical table names.
 
 Do not link this crate and `stonfi-commons-scylla-client` into the same process.
 Both own the same metric names, so initialization would fail rather than
@@ -130,8 +136,11 @@ dollar-quoted values.
   `stonfi_scylla_client`.
 - Replace `anyhow::Result` assumptions with
   `errors::ScyllaClientResult`/`ScyllaClientError` where errors are matched.
-- Rename raw `execute` calls to `execute_unprepared`.
+- Rename raw `execute` calls to `execute_unprepared` and supply a stable
+  `caller`.
 - Rename `select_single_page` calls to `select_page`.
+- Remove the explicit table argument from prepared operations and replace the
+  optional query tag with a required, stable `caller`.
 - Rename the `url` configuration field to `endpoints`; its value remains a
   comma-separated string suitable for environment-variable overrides.
 - Rename `request_timeout_ms` to `request_timeout` and use a human-readable

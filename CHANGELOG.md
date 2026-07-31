@@ -15,5 +15,10 @@ All notable changes to this project will be documented in this file.
   `select_single_page` to `select_page`.
 - Use the upstream prepared-statement cache, derive migrator configuration from
   the validated client, and report concurrency wait time for every query type.
+- Infer prepared-query table labels from driver metadata, replace explicit
+  table plus optional query-tag arguments with one required `caller`, and
+  rename the metric label to `caller`.
+- Leave metrics initialization to applications and require a caller label for
+  unprepared queries.
 - Add public documentation, Docker-backed integration tests, and GitHub release
   automation.
