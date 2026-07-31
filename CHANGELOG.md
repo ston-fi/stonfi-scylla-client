@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 - Support single-endpoint deployments whose server-advertised RPC addresses are
   not directly reachable.
+- Fix Git-only release automation for the unpublished metrics dependency while
+  preserving release-plz SemVer analysis and crates.io opt-out.
 
 ## 0.0.1
 

@@ -103,10 +103,11 @@ same change. Keep package metadata consistent with the repository and retain
 `AGENTS.md`, `README.md`, `CHANGELOG.md`, `LICENSE`, examples, and source in the
 package.
 
-The crate is Git-distributed with `publish = false`. Release-plz may create
-`v<version>` tags and GitHub Releases only. Do not enable crates.io publishing,
-add registry credentials, or manually create releases without explicit
-authorization.
+The crate is Git-distributed with `publish = false`. Release-plz owns SemVer
+analysis plus the version and changelog pull request. After that pull request is
+merged, the validated main-branch workflow creates the `v<version>` tag and
+GitHub Release. Do not enable crates.io publishing, add registry credentials, or
+manually create releases without explicit authorization.
 
 ## Common mistakes
 

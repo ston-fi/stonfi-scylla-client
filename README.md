@@ -147,4 +147,6 @@ git diff --check
 ```
 
 Merges to `main` run release-plz after all validation jobs succeed. Release-plz
-creates Git tags and GitHub Releases; it does not publish to crates.io.
+checks SemVer compatibility and opens or updates a version and changelog pull
+request. Merging that release pull request creates the matching `v<version>` Git
+tag and GitHub Release. The workflow does not publish to crates.io.
