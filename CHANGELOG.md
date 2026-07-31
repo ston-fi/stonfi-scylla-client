@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## [0.0.2](https://github.com/ston-fi/stonfi-scylla-client/compare/v0.0.1...v0.0.2) - 2026-07-31
+
+### Other
+
+- fix git-only release flow
+- single-endpoint translation
+
 - Support single-endpoint deployments whose server-advertised RPC addresses are
   not directly reachable.
 - Fix Git-only release automation for the unpublished metrics dependency while
