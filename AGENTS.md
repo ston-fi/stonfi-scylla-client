@@ -3,7 +3,7 @@
 ## Purpose
 
 This repository contains the public `stonfi_scylla_client` Rust library. It is
-distributed through Git tags for use by STON.fi services. Use the
+published to crates.io and released through matching Git tags. Use the
 `rust-library-review` skill for every non-trivial review, implementation,
 refactor, dependency update, API change, or release task.
 
@@ -103,11 +103,13 @@ same change. Keep package metadata consistent with the repository and retain
 `AGENTS.md`, `README.md`, `CHANGELOG.md`, `LICENSE`, examples, and source in the
 package.
 
-The crate is Git-distributed with `publish = false`. Release-plz owns SemVer
-analysis plus the version and changelog pull request. After that pull request is
-merged, the validated main-branch workflow creates the `v<version>` tag and
-GitHub Release. Do not enable crates.io publishing, add registry credentials, or
-manually create releases without explicit authorization.
+Release-plz owns crates.io publication, SemVer analysis, Git tags and GitHub
+Releases, plus future version and changelog pull requests. Store the crates.io
+API token only in the protected `CRATES_IO_REGISTRY_TOKEN` GitHub Actions
+secret, and map it to Cargo's standard `CARGO_REGISTRY_TOKEN` environment
+variable only inside the release job. The initial publication requires a token
+with `publish-new`; never commit or print registry credentials. Do not publish
+manually or create release tags outside the validated release workflow.
 
 ## Common mistakes
 
@@ -148,6 +150,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features --locked
 cargo +1.88.0 check --all-features --locked
 cargo package --list --locked
+cargo publish --dry-run --locked
 git diff --check
 ```
 

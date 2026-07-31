@@ -25,6 +25,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features --locked
       - run: cargo package --list --locked
+      - run: cargo publish --dry-run --locked
 
   integration:
     runs-on: ubuntu-latest
@@ -45,72 +46,9 @@ jobs:
           toolchain: 1.88.0
       - run: cargo check --all-features --locked
 
-  github-release:
+  release-plz:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [quality, integration, msrv]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Detect merged release PR
-        id: release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          release_pr="$(
-            gh api \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
-              --jq 'map(select(.base.ref == "main" and .merged_at != null and (.head.ref | startswith("release-plz-"))))[0].number // empty'
-          )"
-          if [[ -z "$release_pr" ]]; then
-            echo "No merged release-plz PR is associated with ${GITHUB_SHA}."
-            echo "create=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "stonfi_scylla_client") | .version')"
-          if [[ -z "$version" || "$version" == "null" ]]; then
-            echo "Could not determine stonfi_scylla_client version." >&2
-            exit 1
-          fi
-
-          echo "create=true" >> "$GITHUB_OUTPUT"
-          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
-      - name: Create Git tag and GitHub Release
-        if: steps.release.outputs.create == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
-            tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
-            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
-              echo "Tag ${RELEASE_TAG} points to ${tag_commit}, expected ${GITHUB_SHA}." >&2
-              exit 1
-            fi
-          fi
-
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "GitHub Release ${RELEASE_TAG} already exists."
-            exit 0
-          fi
-
-          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
-            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
-          else
-            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --generate-notes
-          fi
-
-  release-pr:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [quality, integration, msrv, github-release]
     runs-on: ubuntu-latest
     concurrency:
       group: release-plz-${{ github.ref }}
@@ -125,38 +63,9 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Configure Cargo for Git-only package comparison
-        env:
-          RELEASE_PLZ_CARGO_HOME: ${{ runner.temp }}/release-plz-cargo
-        run: |
-          latest_release_tag="$(git tag --list 'v[0-9]*' --sort=-v:refname | sed -n '1p')"
-          if [[ -z "$latest_release_tag" ]]; then
-            echo "No release tag is available for release-plz comparison." >&2
-            exit 1
-          fi
-
-          metrics_tag="$(
-            git show "${latest_release_tag}:Cargo.toml" |
-              sed -nE 's/^stonfi_metrics = .*tag = "([^"]+)".*/\1/p'
-          )"
-          if [[ -z "$metrics_tag" ]]; then
-            echo "Could not determine the stonfi_metrics tag from ${latest_release_tag}." >&2
-            exit 1
-          fi
-
-          # release-plz packages the previous Git-only release. Cargo strips the
-          # Git source while packaging, so provide the matching crate as a
-          # crates.io patch without changing or publishing either manifest.
-          mkdir -p "$RELEASE_PLZ_CARGO_HOME"
-          {
-            echo '[patch.crates-io]'
-            printf 'stonfi_metrics = { git = "https://github.com/ston-fi/stonfi-metrics", tag = "%s" }\n' "$metrics_tag"
-          } > "$RELEASE_PLZ_CARGO_HOME/config.toml"
-          echo "$RELEASE_PLZ_CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
         with:
-          command: release-pr
           version: "0.3.160"
         env:
-          CARGO_HOME: ${{ runner.temp }}/release-plz-cargo
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_REGISTRY_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

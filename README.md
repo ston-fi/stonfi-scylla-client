@@ -7,14 +7,14 @@ It adds bounded query concurrency, retries, prepared-statement caching,
 Prometheus metrics, and simple CQL migration templates on top of the upstream
 `scylla` driver.
 
-The crate is distributed through Git tags and is not published to crates.io.
+The crate is published to crates.io and also released through matching Git tags.
 
 ## Installation
 
 ```toml
 [dependencies]
-stonfi_scylla_client = { git = "https://github.com/ston-fi/stonfi-scylla-client", tag = "v0.0.1" }
-stonfi_metrics = { version = "0.0.1", git = "https://github.com/ston-fi/stonfi-metrics", tag = "v0.0.1" }
+stonfi_scylla_client = "0.1.0"
+stonfi_metrics = "0.1.0"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -143,10 +143,12 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features --locked
 cargo +1.88.0 check --all-features --locked
 cargo package --list --locked
+cargo publish --dry-run --locked
 git diff --check
 ```
 
 Merges to `main` run release-plz after all validation jobs succeed. Release-plz
-checks SemVer compatibility and opens or updates a version and changelog pull
-request. Merging that release pull request creates the matching `v<version>` Git
-tag and GitHub Release. The workflow does not publish to crates.io.
+publishes an unpublished manifest version to crates.io, creates the matching
+`v<version>` Git tag and GitHub Release, checks SemVer compatibility, and opens
+or updates the next version and changelog pull request. The workflow reads the
+crates.io API token from the `CRATES_IO_REGISTRY_TOKEN` GitHub Actions secret.
