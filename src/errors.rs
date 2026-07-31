@@ -17,6 +17,15 @@ pub enum ScyllaClientError {
         /// Human-readable invariant that was violated.
         reason: String,
     },
+    /// A single configured endpoint could not be resolved.
+    #[error("failed to resolve Scylla endpoint `{endpoint}`")]
+    ResolveEndpoint {
+        /// Endpoint supplied by the caller.
+        endpoint: String,
+        /// Underlying resolver failure.
+        #[source]
+        source: Box<dyn Error + Send + Sync + 'static>,
+    },
     /// Establishing the driver session failed.
     #[error("failed to connect to ScyllaDB")]
     Connect {
@@ -73,6 +82,16 @@ impl ScyllaClientError {
 
     pub(crate) fn connect(source: impl Error + Send + Sync + 'static) -> Self {
         Self::Connect {
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) fn resolve_endpoint(
+        endpoint: impl Into<String>,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::ResolveEndpoint {
+            endpoint: endpoint.into(),
             source: Box::new(source),
         }
     }

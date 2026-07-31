@@ -28,6 +28,10 @@ the exact driver types and derives that match the client. Do not add parallel
 root re-exports, aliases, builders, or compatibility wrappers without a
 demonstrated downstream need.
 
+Internal address translation belongs in `address_translator.rs`. Keep it
+private and configure it through `ScyllaClient`; do not expose driver sessions
+or parallel connection constructors.
+
 ## Construction and runtime
 
 Applications should:
@@ -49,6 +53,10 @@ The request timeout and retry delays are `Duration` values deserialized through
 `humantime_serde`; missing retry blocks and fields use the documented
 `RetryConfig` defaults. Configuration structs reject unknown fields. Add
 validation at construction rather than silently normalizing invalid values.
+When exactly one endpoint is configured, the client resolves it and translates
+all server-advertised peer addresses to that endpoint, preferring IPv4 when
+available and defaulting to port `9042` when omitted. Multiple endpoints use the
+driver's advertised topology unchanged.
 
 ## Queries, errors, and metrics
 
@@ -77,17 +85,14 @@ validation at construction rather than silently normalizing invalid values.
   and `caller` query labels.
 - Do not test Prometheus registration, label names, or increments. Test the
   project behavior that drives metrics instead.
-- The old commons client owns the same metric names. Consumers must migrate
-  atomically rather than link both crates in one process.
 
 ## Simple migrations
 
-`SimpleMigrator` is intentionally stateless, derives the validated keyspace
-configuration from its client, and reruns all supplied statements. Keep its
-keyspace placeholders stable. Changes to splitting must include deterministic
-tests for line endings, comments, delimiters, and quoting. Keep the incomplete
-splitter private; do not present it as a public parser or expand it into a
-versioned migration system without an explicit design task.
+`SimpleMigrator` is stateless, derives the validated keyspace configuration
+from its client, and reruns all supplied statements. Keep its keyspace
+placeholders stable. The private splitter supports only the syntax documented
+in README and rustdoc; changes require deterministic tests for line endings,
+comments, delimiters, and quoting.
 
 ## Public-library changes
 

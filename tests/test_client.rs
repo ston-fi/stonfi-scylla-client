@@ -42,11 +42,9 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
     let port_reservation = TcpListener::bind(("127.0.0.1", 0))?;
     let listening_port = port_reservation.local_addr()?.port();
     drop(port_reservation);
-    let listening_port_arg = listening_port.to_string();
-
     let container = GenericImage::new("scylladb/scylla", "6.0")
         .with_wait_for(WaitFor::message_on_stderr("initialization completed"))
-        .with_mapped_port(listening_port, listening_port.tcp())
+        .with_mapped_port(listening_port, 9042.tcp())
         .with_cmd([
             "--smp",
             "1",
@@ -62,18 +60,12 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
             "false",
             "--developer-mode",
             "1",
-            "--rpc-address",
-            "0.0.0.0",
-            "--broadcast-rpc-address",
-            "127.0.0.1",
-            "--native-transport-port",
-            listening_port_arg.as_str(),
         ])
         .start()
         .await?;
 
     let config = ScyllaClientConfig {
-        endpoints: format!("127.0.0.1:{listening_port}"),
+        endpoints: format!("localhost:{listening_port}"),
         max_parallel_queries: 4,
         keyspace: KeyspaceConfig {
             name: format!("scylla_client_test_{}", std::process::id()),
