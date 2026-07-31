@@ -1984,6 +1984,7 @@ name = "stonfi_scylla_client"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures-util",
  "humantime-serde",
  "log",

@@ -39,6 +39,7 @@
 //! # }
 //! ```
 
+mod address_translator;
 /// Instrumented ScyllaDB client and row deserialization bound.
 pub mod client;
 /// Deserializable client, keyspace, and retry configuration.

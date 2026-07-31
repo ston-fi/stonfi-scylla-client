@@ -7,8 +7,7 @@ It adds bounded query concurrency, retries, prepared-statement caching,
 Prometheus metrics, and simple CQL migration templates on top of the upstream
 `scylla` driver.
 
-The initial release is distributed from GitHub and is not published to
-crates.io.
+The crate is distributed through Git tags and is not published to crates.io.
 
 ## Installation
 
@@ -90,6 +89,10 @@ inside it, use `RetryConfig::default()`.
 - `select_one` returns an error when a successful query produces more than one
   row.
 - The client uses LZ4 compression and `LocalQuorum` consistency.
+- A single configured endpoint becomes the address for every
+  server-advertised peer, preferring IPv4 when the endpoint resolves to both
+  address families and defaulting to port `9042` when omitted. Multiple
+  configured endpoints use the driver's advertised topology unchanged.
 - Public operations return
   `errors::ScyllaClientResult<T>` with matchable, non-exhaustive error
   categories and preserved source chains.
@@ -113,10 +116,6 @@ argument supplies the `caller` label. Use stable, bounded caller names rather
 than record identifiers or request IDs. Queries must also target a bounded set
 of physical table names.
 
-Do not link this crate and `stonfi-commons-scylla-client` into the same process.
-Both own the same metric names, so initialization would fail rather than
-silently produce duplicate collectors.
-
 ## Simple migrations
 
 `simple_migrator::SimpleMigrator` uses the client's validated keyspace
@@ -128,29 +127,6 @@ The splitter supports LF and CRLF, final statements without semicolons,
 full-line `--` and `//` comments, and semicolons inside single- or double-quoted
 values. It is not a complete CQL parser and does not interpret block comments or
 dollar-quoted values.
-
-## Migrating from the commons crate
-
-- Rename dependency `stonfi-commons-scylla-client` to `stonfi_scylla_client`.
-- Rename Rust imports from `stonfi_commons_scylla_client` to
-  `stonfi_scylla_client`.
-- Replace `anyhow::Result` assumptions with
-  `errors::ScyllaClientResult`/`ScyllaClientError` where errors are matched.
-- Rename raw `execute` calls to `execute_unprepared` and supply a stable
-  `caller`.
-- Rename `select_single_page` calls to `select_page`.
-- Remove the explicit table argument from prepared operations and replace the
-  optional query tag with a required, stable `caller`.
-- Rename the `url` configuration field to `endpoints`; its value remains a
-  comma-separated string suitable for environment-variable overrides.
-- Rename `request_timeout_ms` to `request_timeout` and use a human-readable
-  duration such as `5s`.
-- Replace the top-level retry fields with the nested `retry` policy. YAML retry
-  delays now use human-readable durations such as `50ms` and `1s`.
-- Remove `provide_metrics` collector wiring and initialize `stonfi_metrics`
-  during application startup.
-- Switch atomically; do not run both clients in one process because their
-  Prometheus metric names intentionally remain stable.
 
 ## Development
 

@@ -18,6 +18,7 @@ use scylla::statement::prepared::PreparedStatement;
 use scylla::value::Row;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use crate::address_translator::configure_known_nodes;
 use crate::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig, validate_config};
 use crate::errors::{ScyllaClientError, ScyllaClientResult};
 use crate::metrics::ScyllaClientMetrics;
@@ -53,8 +54,9 @@ impl ScyllaClient {
     /// # Errors
     ///
     /// Returns [`ScyllaClientError::InvalidConfig`] for invalid configuration,
-    /// or [`ScyllaClientError::Connect`] when the driver session cannot be
-    /// established.
+    /// [`ScyllaClientError::ResolveEndpoint`] when the sole configured endpoint
+    /// cannot be resolved, or [`ScyllaClientError::Connect`] when the driver
+    /// session cannot be established.
     pub async fn new(config: &ScyllaClientConfig) -> ScyllaClientResult<Self> {
         let endpoints = validate_config(config)?;
         let inner = Inner::new(config, &endpoints).await?;
@@ -286,12 +288,8 @@ impl Inner {
             .retry_policy(Arc::new(FallthroughRetryPolicy::new()))
             .build();
 
-        let mut session_builder = SessionBuilder::new();
-        for endpoint in endpoints {
-            session_builder = session_builder.known_node(endpoint);
-        }
-
-        let session = session_builder
+        let session = configure_known_nodes(SessionBuilder::new(), endpoints)
+            .await?
             .compression(Some(Compression::Lz4))
             .default_execution_profile_handle(profile.into_handle())
             .build()

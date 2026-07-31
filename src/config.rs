@@ -27,6 +27,11 @@ use crate::errors::{ScyllaClientError, ScyllaClientResult};
 #[serde(deny_unknown_fields)]
 pub struct ScyllaClientConfig {
     /// Comma-separated ScyllaDB contact endpoints.
+    ///
+    /// When exactly one endpoint is configured, server-advertised peer
+    /// addresses are translated to that resolved endpoint, preferring IPv4
+    /// when available. A missing port defaults to `9042`. Multiple endpoints
+    /// use the driver's advertised topology unchanged.
     pub endpoints: String,
     /// Maximum number of queries that may be active through this client.
     pub max_parallel_queries: usize,
