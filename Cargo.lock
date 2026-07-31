@@ -1968,8 +1968,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stonfi_metrics"
-version = "0.0.1"
-source = "git+https://github.com/ston-fi/stonfi-metrics?tag=v0.0.1#32f7b2404506f38771f4dea3fe58f747844ba7c2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36879e49370869451cfb8f2a22e6f165f87a962d0b20979e2697fb0b72569bbf"
 dependencies = [
  "anyhow",
  "axum",
@@ -1981,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "stonfi_scylla_client"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
