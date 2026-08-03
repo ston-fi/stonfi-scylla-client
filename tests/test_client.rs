@@ -7,7 +7,6 @@ use scylla::response::PagingState;
 use scylla::statement::Statement;
 use scylla::{DeserializeRow, SerializeRow};
 use stonfi_scylla_client::client::ScyllaClient;
-use stonfi_scylla_client::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig};
 use stonfi_scylla_client::errors::ScyllaClientError;
 use stonfi_scylla_client::simple_migrator::SimpleMigrator;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -64,22 +63,16 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
         .start()
         .await?;
 
-    let config = ScyllaClientConfig {
-        endpoints: format!("localhost:{listening_port}"),
-        max_parallel_queries: 4,
-        keyspace: KeyspaceConfig {
-            name: format!("scylla_client_test_{}", std::process::id()),
-            replication_factor: 1,
-        },
-        request_timeout: Duration::from_secs(2),
-        retry: RetryConfig {
-            max_retries: 3,
-            min_delay: Duration::from_millis(25),
-            max_delay: Duration::from_millis(250),
-        },
-    };
-
-    let client = ScyllaClient::new(&config).await?;
+    let keyspace = format!("scylla_client_test_{}", std::process::id());
+    let client = ScyllaClient::builder(format!("localhost:{listening_port}"), keyspace.clone())
+        .with_max_parallel_queries(4)
+        .with_replication_factor(1)
+        .with_request_timeout(Duration::from_secs(2))
+        .with_retry_count(3)
+        .with_retry_min_delay(Duration::from_millis(25))
+        .with_retry_max_delay(Duration::from_millis(250))
+        .build()
+        .await?;
     wait_for_scylla(&client, &container).await?;
     let migrator = SimpleMigrator::new(client.clone());
     migrator
@@ -97,7 +90,7 @@ async fn test_client_end_to_end() -> anyhow::Result<()> {
         row.columns[0]
             .as_ref()
             .and_then(|value| value.clone().into_string())
-            .is_some_and(|name| name == config.keyspace.name)
+            .is_some_and(|name| name == keyspace)
     }));
 
     let empty = client
