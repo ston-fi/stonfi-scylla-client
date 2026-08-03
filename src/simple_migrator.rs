@@ -1,4 +1,4 @@
-use crate::client::{KeyspaceSettings, ScyllaClient};
+use crate::client::ScyllaClient;
 use crate::errors::{ScyllaClientError, ScyllaClientResult};
 
 /// Minimal CQL migration runner with keyspace template substitution.
@@ -8,15 +8,13 @@ use crate::errors::{ScyllaClientError, ScyllaClientResult};
 /// be idempotent when repeated execution is possible.
 pub struct SimpleMigrator {
     client: ScyllaClient,
-    keyspace: KeyspaceSettings,
 }
 
 impl SimpleMigrator {
     /// Create a migrator using the client's validated keyspace configuration.
     #[must_use]
     pub fn new(client: ScyllaClient) -> Self {
-        let keyspace = client.keyspace_settings();
-        Self { client, keyspace }
+        Self { client }
     }
 
     /// Split and apply each migration input in order.
@@ -47,7 +45,11 @@ impl SimpleMigrator {
     /// Returns [`ScyllaClientError::Query`] when ScyllaDB rejects the rendered
     /// statement.
     pub async fn apply(&self, query_template: &str) -> ScyllaClientResult<()> {
-        let query = render_statement(query_template, &self.keyspace);
+        let query = render_statement(
+            query_template,
+            self.client.keyspace_name(),
+            self.client.replication_factor(),
+        );
         log::trace!("Executing migration statement: {query}");
         self.client
             .execute_unprepared(&query, "simple_migrator")
@@ -167,13 +169,10 @@ impl SimpleMigrator {
     }
 }
 
-fn render_statement(query_template: &str, keyspace: &KeyspaceSettings) -> String {
+fn render_statement(query_template: &str, keyspace_name: &str, replication_factor: u64) -> String {
     query_template
-        .replace("[[KEYSPACE_NAME]]", &keyspace.name)
-        .replace(
-            "[[REPLICATION_FACTOR]]",
-            &keyspace.replication_factor.to_string(),
-        )
+        .replace("[[KEYSPACE_NAME]]", keyspace_name)
+        .replace("[[REPLICATION_FACTOR]]", &replication_factor.to_string())
 }
 
 fn push_statement(statements: &mut Vec<String>, statement: &mut String) {
@@ -187,7 +186,6 @@ fn push_statement(statements: &mut Vec<String>, statement: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{SimpleMigrator, render_statement};
-    use crate::client::KeyspaceSettings;
 
     #[test]
     fn test_split_statements_handles_comments_line_endings_and_trailing_statement() {
@@ -221,14 +219,10 @@ mod tests {
 
     #[test]
     fn test_render_statement_substitutes_keyspace_values() {
-        let keyspace = KeyspaceSettings {
-            name: "example".to_owned(),
-            replication_factor: 3,
-        };
-
         let rendered = render_statement(
             "CREATE KEYSPACE [[KEYSPACE_NAME]] WITH replication_factor = [[REPLICATION_FACTOR]]",
-            &keyspace,
+            "example",
+            3,
         );
 
         assert_eq!(

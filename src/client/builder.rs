@@ -2,16 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use derive_setters::Setters;
+use scylla::client::caching_session::CachingSessionBuilder;
+use scylla::client::execution_profile::ExecutionProfile;
+use scylla::client::session_builder::SessionBuilder;
+use scylla::frame::Compression;
+use scylla::policies::retry::FallthroughRetryPolicy;
+use tokio::sync::Semaphore;
 
-use super::{ClientSettings, Inner, KeyspaceSettings, RetrySettings, ScyllaClient};
+use super::{Inner, ScyllaClient};
+use crate::address_translator::configure_known_nodes;
 use crate::errors::{ScyllaClientError, ScyllaClientResult};
-
-const DEFAULT_MAX_PARALLEL_QUERIES: usize = 64;
-const DEFAULT_REPLICATION_FACTOR: u64 = 1;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_RETRY_COUNT: u32 = 3;
-const DEFAULT_RETRY_MIN_DELAY: Duration = Duration::from_millis(50);
-const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 /// Builder for [`ScyllaClient`].
 #[derive(Debug, Setters)]
@@ -36,12 +36,12 @@ impl Builder {
         Self {
             endpoints,
             keyspace,
-            max_parallel_queries: DEFAULT_MAX_PARALLEL_QUERIES,
-            replication_factor: DEFAULT_REPLICATION_FACTOR,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-            retry_count: DEFAULT_RETRY_COUNT,
-            retry_min_delay: DEFAULT_RETRY_MIN_DELAY,
-            retry_max_delay: DEFAULT_RETRY_MAX_DELAY,
+            max_parallel_queries: 64,
+            replication_factor: 1,
+            request_timeout: Duration::from_secs(5),
+            retry_count: 3,
+            retry_min_delay: Duration::from_millis(50),
+            retry_max_delay: Duration::from_secs(1),
         }
     }
 
@@ -54,73 +54,75 @@ impl Builder {
     /// cannot be resolved, or [`ScyllaClientError::Connect`] when the driver
     /// session cannot be established.
     pub async fn build(self) -> ScyllaClientResult<ScyllaClient> {
-        let settings = ClientSettings {
-            endpoints: self.endpoints,
-            max_parallel_queries: self.max_parallel_queries,
-            keyspace: KeyspaceSettings {
-                name: self.keyspace,
-                replication_factor: self.replication_factor,
-            },
-            request_timeout: self.request_timeout,
-            retry: RetrySettings {
-                max_retries: self.retry_count,
-                min_delay: self.retry_min_delay,
-                max_delay: self.retry_max_delay,
-            },
-        };
-        let endpoints = validate_settings(&settings)?;
-        let inner = Inner::new(&settings, &endpoints).await?;
+        let endpoints = self.validate()?;
+        let profile = ExecutionProfile::builder()
+            .request_timeout(Some(self.request_timeout))
+            .consistency(scylla::statement::Consistency::LocalQuorum)
+            .retry_policy(Arc::new(FallthroughRetryPolicy::new()))
+            .build();
+        let session = configure_known_nodes(SessionBuilder::new(), &endpoints)
+            .await?
+            .compression(Some(Compression::Lz4))
+            .default_execution_profile_handle(profile.into_handle())
+            .build()
+            .await
+            .map_err(ScyllaClientError::connect)?;
+        drop(endpoints);
+
         Ok(ScyllaClient {
-            inner: Arc::new(inner),
-            retry_settings: settings.retry,
+            inner: Arc::new(Inner {
+                session: CachingSessionBuilder::new(session).build(),
+                keyspace_name: self.keyspace,
+                replication_factor: self.replication_factor,
+                active_queries: Semaphore::new(self.max_parallel_queries),
+            }),
+            retry_count: self.retry_count,
+            retry_min_delay: self.retry_min_delay,
+            retry_max_delay: self.retry_max_delay,
         })
     }
-}
 
-fn validate_settings(settings: &ClientSettings) -> ScyllaClientResult<Vec<&str>> {
-    let endpoints = settings
-        .endpoints
-        .split(',')
-        .map(str::trim)
-        .collect::<Vec<_>>();
-    if endpoints.is_empty() || endpoints.iter().any(|endpoint| endpoint.is_empty()) {
-        return Err(ScyllaClientError::invalid_config(
-            "endpoints",
-            "must contain one or more nonempty comma-separated endpoints",
-        ));
+    fn validate(&self) -> ScyllaClientResult<Vec<&str>> {
+        let endpoints = self.endpoints.split(',').map(str::trim).collect::<Vec<_>>();
+        if endpoints.is_empty() || endpoints.iter().any(|endpoint| endpoint.is_empty()) {
+            return Err(ScyllaClientError::invalid_config(
+                "endpoints",
+                "must contain one or more nonempty comma-separated endpoints",
+            ));
+        }
+
+        if self.max_parallel_queries == 0 {
+            return Err(ScyllaClientError::invalid_config(
+                "max_parallel_queries",
+                "must be greater than zero",
+            ));
+        }
+
+        validate_keyspace_name(&self.keyspace)?;
+
+        if self.replication_factor == 0 {
+            return Err(ScyllaClientError::invalid_config(
+                "keyspace.replication_factor",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.request_timeout.is_zero() {
+            return Err(ScyllaClientError::invalid_config(
+                "request_timeout",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.retry_max_delay < self.retry_min_delay {
+            return Err(ScyllaClientError::invalid_config(
+                "retry.max_delay",
+                "must be greater than or equal to retry.min_delay",
+            ));
+        }
+
+        Ok(endpoints)
     }
-
-    if settings.max_parallel_queries == 0 {
-        return Err(ScyllaClientError::invalid_config(
-            "max_parallel_queries",
-            "must be greater than zero",
-        ));
-    }
-
-    validate_keyspace_name(&settings.keyspace.name)?;
-
-    if settings.keyspace.replication_factor == 0 {
-        return Err(ScyllaClientError::invalid_config(
-            "keyspace.replication_factor",
-            "must be greater than zero",
-        ));
-    }
-
-    if settings.request_timeout.is_zero() {
-        return Err(ScyllaClientError::invalid_config(
-            "request_timeout",
-            "must be greater than zero",
-        ));
-    }
-
-    if settings.retry.max_delay < settings.retry.min_delay {
-        return Err(ScyllaClientError::invalid_config(
-            "retry.max_delay",
-            "must be greater than or equal to retry.min_delay",
-        ));
-    }
-
-    Ok(endpoints)
 }
 
 fn validate_keyspace_name(name: &str) -> ScyllaClientResult<()> {
@@ -142,97 +144,34 @@ fn validate_keyspace_name(name: &str) -> ScyllaClientResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_settings;
-    use crate::client::{ClientSettings, KeyspaceSettings, RetrySettings};
+    use super::Builder;
     use crate::errors::ScyllaClientError;
-    use std::time::Duration;
-
-    fn valid_settings() -> ClientSettings {
-        ClientSettings {
-            endpoints: "127.0.0.1:9042".to_owned(),
-            max_parallel_queries: 1,
-            keyspace: KeyspaceSettings {
-                name: "test_keyspace".to_owned(),
-                replication_factor: 1,
-            },
-            request_timeout: Duration::from_millis(500),
-            retry: RetrySettings {
-                max_retries: 0,
-                min_delay: Duration::from_millis(10),
-                max_delay: Duration::from_millis(100),
-            },
-        }
-    }
-
-    fn invalid_field(settings: &ClientSettings) -> &'static str {
-        match validate_settings(settings) {
-            Err(ScyllaClientError::InvalidConfig { field, .. }) => field,
-            Err(_) => "unexpected error",
-            Ok(_) => "configuration unexpectedly valid",
-        }
-    }
 
     #[test]
-    fn test_validate_settings_accepts_multiple_endpoints_and_zero_retries() -> anyhow::Result<()> {
-        let mut settings = valid_settings();
-        settings.endpoints = "127.0.0.1:9042, scylla.internal:9042".to_owned();
+    fn test_validate_splits_multiple_endpoints() -> anyhow::Result<()> {
+        let builder = Builder::new(
+            "127.0.0.1:9042, scylla.internal:9042".to_owned(),
+            "test_keyspace".to_owned(),
+        );
 
-        let endpoints = validate_settings(&settings)?;
+        let endpoints = builder.validate()?;
 
         assert_eq!(endpoints, ["127.0.0.1:9042", "scylla.internal:9042"]);
         Ok(())
     }
 
     #[test]
-    fn test_validate_settings_rejects_empty_endpoint() {
-        let mut settings = valid_settings();
-        settings.endpoints = "127.0.0.1:9042, ".to_owned();
-        assert_eq!(invalid_field(&settings), "endpoints");
-    }
-
-    #[test]
-    fn test_validate_settings_rejects_zero_parallel_queries() {
-        let mut settings = valid_settings();
-        settings.max_parallel_queries = 0;
-        assert_eq!(invalid_field(&settings), "max_parallel_queries");
-    }
-
-    #[test]
-    fn test_validate_settings_rejects_invalid_keyspace_name() {
-        for invalid_name in ["", "1keyspace", "key-space", "key space", "keyspace;drop"] {
-            let mut settings = valid_settings();
-            settings.keyspace.name = invalid_name.to_owned();
-            assert_eq!(invalid_field(&settings), "keyspace.name");
+    fn test_validate_rejects_unsafe_keyspace_names() {
+        for keyspace in ["", "1keyspace", "key-space", "key space", "keyspace;drop"] {
+            let builder = Builder::new("127.0.0.1:9042".to_owned(), keyspace.to_owned());
+            let result = builder.validate();
+            assert!(matches!(
+                result,
+                Err(ScyllaClientError::InvalidConfig {
+                    field: "keyspace.name",
+                    ..
+                })
+            ));
         }
-    }
-
-    #[test]
-    fn test_validate_settings_rejects_zero_replication_factor() {
-        let mut settings = valid_settings();
-        settings.keyspace.replication_factor = 0;
-        assert_eq!(invalid_field(&settings), "keyspace.replication_factor");
-    }
-
-    #[test]
-    fn test_validate_settings_rejects_zero_request_timeout() {
-        let mut settings = valid_settings();
-        settings.request_timeout = Duration::ZERO;
-        assert_eq!(invalid_field(&settings), "request_timeout");
-    }
-
-    #[test]
-    fn test_validate_settings_accepts_zero_min_retry_delay() -> anyhow::Result<()> {
-        let mut settings = valid_settings();
-        settings.retry.min_delay = Duration::ZERO;
-        validate_settings(&settings)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_validate_settings_rejects_inverted_retry_delays() {
-        let mut settings = valid_settings();
-        settings.retry.min_delay = Duration::from_millis(100);
-        settings.retry.max_delay = Duration::from_millis(99);
-        assert_eq!(invalid_field(&settings), "retry.max_delay");
     }
 }
