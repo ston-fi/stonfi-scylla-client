@@ -16,7 +16,6 @@ use crate::errors::{ScyllaClientError, ScyllaClientResult};
 /// Builder for [`ScyllaClient`].
 #[derive(Debug, Setters)]
 #[setters(prefix = "with_")]
-#[non_exhaustive]
 #[must_use]
 pub struct Builder {
     #[setters(skip)]
