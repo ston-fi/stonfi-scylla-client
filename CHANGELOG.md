@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Replace the deserializable public configuration structs and
+  `ScyllaClient::new` with an asynchronous `ScyllaClient::builder` construction
+  API. Applications now own configuration deserialization.
+
 ## [0.1.0](https://github.com/ston-fi/stonfi-scylla-client/compare/v0.0.2...v0.1.0) - 2026-07-31
 
 ### Changed

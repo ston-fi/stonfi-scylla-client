@@ -4,8 +4,7 @@
 //! retry policy, prepared-statement caching, Prometheus metrics, and a
 //! deliberately small CQL migration helper.
 //!
-//! Construct [`client::ScyllaClient`] from a
-//! [`config::ScyllaClientConfig`].
+//! Construct [`client::ScyllaClient`] through its builder.
 //!
 //! # Example
 //!
@@ -13,27 +12,19 @@
 //! use std::time::Duration;
 //!
 //! use stonfi_scylla_client::client::ScyllaClient;
-//! use stonfi_scylla_client::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig};
 //!
 //! # async fn connect() -> anyhow::Result<()> {
 //! stonfi_metrics::init_metrics!()?;
 //!
-//! let config = ScyllaClientConfig {
-//!     endpoints: "127.0.0.1:9042".to_owned(),
-//!     max_parallel_queries: 64,
-//!     keyspace: KeyspaceConfig {
-//!         name: "my_service".to_owned(),
-//!         replication_factor: 3,
-//!     },
-//!     request_timeout: Duration::from_secs(5),
-//!     retry: RetryConfig {
-//!         max_retries: 3,
-//!         min_delay: Duration::from_millis(50),
-//!         max_delay: Duration::from_secs(1),
-//!     },
-//! };
-//!
-//! let client = ScyllaClient::new(&config).await?;
+//! let client = ScyllaClient::builder("127.0.0.1:9042", "my_service")
+//!     .with_max_parallel_queries(64)
+//!     .with_replication_factor(3)
+//!     .with_request_timeout(Duration::from_secs(5))
+//!     .with_retry_count(3)
+//!     .with_retry_min_delay(Duration::from_millis(50))
+//!     .with_retry_max_delay(Duration::from_secs(1))
+//!     .build()
+//!     .await?;
 //! client.use_keyspace().await?;
 //! # Ok(())
 //! # }
@@ -42,8 +33,6 @@
 mod address_translator;
 /// Instrumented ScyllaDB client and row deserialization bound.
 pub mod client;
-/// Deserializable client, keyspace, and retry configuration.
-pub mod config;
 /// Errors returned by client and migration operations.
 pub mod errors;
 /// Minimal CQL migration helper.
