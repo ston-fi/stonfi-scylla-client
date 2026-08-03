@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## [0.2.0](https://github.com/ston-fi/stonfi-scylla-client/compare/v0.1.0...v0.2.0) - 2026-08-03
+
+### Other
+
+- replace configuration with builder
+
 ### Changed
 
 - Replace the deserializable public configuration structs and
