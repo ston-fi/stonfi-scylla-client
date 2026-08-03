@@ -1,3 +1,5 @@
+mod builder;
+
 use std::borrow::Cow;
 use std::error::Error;
 use std::future::Future;
@@ -19,13 +21,35 @@ use scylla::value::Row;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::address_translator::configure_known_nodes;
-use crate::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig, validate_config};
 use crate::errors::{ScyllaClientError, ScyllaClientResult};
 use crate::metrics::ScyllaClientMetrics;
 use crate::types::QueryType;
 use crate::types::QueryType::{Delete, Execute, Insert, Select};
 
 const TABLE_UNKNOWN: &str = "unknown";
+
+use self::builder::Builder;
+
+struct ClientSettings {
+    endpoints: String,
+    max_parallel_queries: usize,
+    keyspace: KeyspaceSettings,
+    request_timeout: Duration,
+    retry: RetrySettings,
+}
+
+#[derive(Clone)]
+pub(crate) struct KeyspaceSettings {
+    pub(crate) name: String,
+    pub(crate) replication_factor: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RetrySettings {
+    max_retries: u32,
+    min_delay: Duration,
+    max_delay: Duration,
+}
 
 /// Row types that can be deserialized by the upstream Scylla driver.
 ///
@@ -45,25 +69,18 @@ impl<T> DeserRow for T where
 #[derive(Clone)]
 pub struct ScyllaClient {
     inner: Arc<Inner>,
-    retry_config: RetryConfig,
+    retry_settings: RetrySettings,
 }
 
 impl ScyllaClient {
-    /// Validate configuration and connect to ScyllaDB.
+    /// Start configuring a client for the comma-separated contact endpoints
+    /// and unquoted CQL keyspace name.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScyllaClientError::InvalidConfig`] for invalid configuration,
-    /// [`ScyllaClientError::ResolveEndpoint`] when the sole configured endpoint
-    /// cannot be resolved, or [`ScyllaClientError::Connect`] when the driver
-    /// session cannot be established.
-    pub async fn new(config: &ScyllaClientConfig) -> ScyllaClientResult<Self> {
-        let endpoints = validate_config(config)?;
-        let inner = Inner::new(config, &endpoints).await?;
-        Ok(Self {
-            inner: Arc::new(inner),
-            retry_config: config.retry,
-        })
+    /// The builder defaults to 64 concurrent queries, replication factor 1, a
+    /// 5-second request timeout, and three retries with exponential backoff
+    /// between 50ms and 1s.
+    pub fn builder(endpoints: impl Into<String>, keyspace: impl Into<String>) -> Builder {
+        Builder::new(endpoints.into(), keyspace.into())
     }
 
     /// Execute a retried prepared query and deserialize all rows.
@@ -80,7 +97,7 @@ impl ScyllaClient {
         values: impl SerializeRow + Clone,
         caller: &'static str,
     ) -> ScyllaClientResult<Vec<R>> {
-        execute_with_retry(&self.retry_config, || {
+        execute_with_retry(&self.retry_settings, || {
             self.inner.select(query.clone(), values.clone(), caller)
         })
         .await
@@ -103,7 +120,7 @@ impl ScyllaClient {
         values: impl SerializeRow + Clone,
         caller: &'static str,
     ) -> ScyllaClientResult<Option<R>> {
-        let selected = execute_with_retry(&self.retry_config, || {
+        let selected = execute_with_retry(&self.retry_settings, || {
             self.inner
                 .select::<R>(query.clone(), values.clone(), caller)
         })
@@ -126,7 +143,7 @@ impl ScyllaClient {
         values: impl SerializeRow + Clone,
         caller: &'static str,
     ) -> ScyllaClientResult<Vec<Row>> {
-        execute_with_retry(&self.retry_config, || {
+        execute_with_retry(&self.retry_settings, || {
             self.inner.select(query.clone(), values.clone(), caller)
         })
         .await
@@ -149,7 +166,7 @@ impl ScyllaClient {
         paging_state: PagingState,
         caller: &'static str,
     ) -> ScyllaClientResult<(Vec<R>, ControlFlow<(), PagingState>)> {
-        execute_with_retry(&self.retry_config, || {
+        execute_with_retry(&self.retry_settings, || {
             self.inner
                 .select_page(query.clone(), values.clone(), paging_state.clone(), caller)
         })
@@ -171,7 +188,7 @@ impl ScyllaClient {
         values: impl SerializeRow + Clone,
         caller: &'static str,
     ) -> ScyllaClientResult<()> {
-        execute_with_retry(&self.retry_config, || {
+        execute_with_retry(&self.retry_settings, || {
             self.inner
                 .query(query.clone(), values.clone(), Insert, caller)
         })
@@ -193,7 +210,7 @@ impl ScyllaClient {
         values: impl SerializeRow + Clone,
         caller: &'static str,
     ) -> ScyllaClientResult<()> {
-        execute_with_retry(&self.retry_config, || {
+        execute_with_retry(&self.retry_settings, || {
             self.inner
                 .query(query.clone(), values.clone(), Delete, caller)
         })
@@ -210,7 +227,7 @@ impl ScyllaClient {
     /// exhausted.
     pub async fn use_keyspace(&self) -> ScyllaClientResult<()> {
         let query = format!("USE {}", self.inner.keyspace.name);
-        execute_with_retry(&self.retry_config, || {
+        execute_with_retry(&self.retry_settings, || {
             self.execute_unprepared(&query, "use_keyspace")
         })
         .await
@@ -235,20 +252,20 @@ impl ScyllaClient {
             .await
     }
 
-    pub(crate) fn keyspace_config(&self) -> KeyspaceConfig {
+    pub(crate) fn keyspace_settings(&self) -> KeyspaceSettings {
         self.inner.keyspace.clone()
     }
 }
 
-async fn execute_with_retry<F, Fut, T, E>(config: &RetryConfig, operation: F) -> Result<T, E>
+async fn execute_with_retry<F, Fut, T, E>(settings: &RetrySettings, operation: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
     tryhard::retry_fn(operation)
-        .retries(config.max_retries)
-        .exponential_backoff(config.min_delay)
-        .max_delay(config.max_delay)
+        .retries(settings.max_retries)
+        .exponential_backoff(settings.min_delay)
+        .max_delay(settings.max_delay)
         .await
 }
 
@@ -276,14 +293,14 @@ struct SelectedRows<T> {
 
 struct Inner {
     session: CachingSession,
-    keyspace: KeyspaceConfig,
+    keyspace: KeyspaceSettings,
     active_queries: Semaphore,
 }
 
 impl Inner {
-    async fn new(config: &ScyllaClientConfig, endpoints: &[&str]) -> ScyllaClientResult<Self> {
+    async fn new(settings: &ClientSettings, endpoints: &[&str]) -> ScyllaClientResult<Self> {
         let profile = ExecutionProfile::builder()
-            .request_timeout(Some(config.request_timeout))
+            .request_timeout(Some(settings.request_timeout))
             .consistency(scylla::statement::Consistency::LocalQuorum)
             .retry_policy(Arc::new(FallthroughRetryPolicy::new()))
             .build();
@@ -298,8 +315,8 @@ impl Inner {
 
         Ok(Self {
             session: CachingSessionBuilder::new(session).build(),
-            keyspace: config.keyspace.clone(),
-            active_queries: Semaphore::new(config.max_parallel_queries),
+            keyspace: settings.keyspace.clone(),
+            active_queries: Semaphore::new(settings.max_parallel_queries),
         })
     }
 
@@ -529,20 +546,19 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use super::{execute_with_retry, into_optional_single};
-    use crate::config::RetryConfig;
+    use super::{RetrySettings, execute_with_retry, into_optional_single};
     use crate::errors::ScyllaClientError;
 
     #[tokio::test]
-    async fn test_retry_config_stops_after_configured_retries() {
+    async fn test_retry_settings_stops_after_configured_retries() {
         let attempts = Arc::new(AtomicU32::new(0));
-        let retry_config = RetryConfig {
+        let retry_settings = RetrySettings {
             min_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(1),
             max_retries: 3,
         };
 
-        let result = execute_with_retry(&retry_config, || {
+        let result = execute_with_retry(&retry_settings, || {
             let attempts = Arc::clone(&attempts);
             async move {
                 attempts.fetch_add(1, Ordering::Relaxed);

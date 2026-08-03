@@ -29,27 +29,19 @@ use their existing error and runtime setup instead.
 use std::time::Duration;
 
 use stonfi_scylla_client::client::ScyllaClient;
-use stonfi_scylla_client::config::{KeyspaceConfig, RetryConfig, ScyllaClientConfig};
 
 # async fn connect() -> anyhow::Result<()> {
 stonfi_metrics::init_metrics!()?;
 
-let config = ScyllaClientConfig {
-    endpoints: "127.0.0.1:9042".to_owned(),
-    max_parallel_queries: 64,
-    keyspace: KeyspaceConfig {
-        name: "my_service".to_owned(),
-        replication_factor: 3,
-    },
-    request_timeout: Duration::from_secs(5),
-    retry: RetryConfig {
-        max_retries: 3,
-        min_delay: Duration::from_millis(50),
-        max_delay: Duration::from_secs(1),
-    },
-};
-
-let client = ScyllaClient::new(&config).await?;
+let client = ScyllaClient::builder("127.0.0.1:9042", "my_service")
+    .with_max_parallel_queries(64)
+    .with_replication_factor(3)
+    .with_request_timeout(Duration::from_secs(5))
+    .with_retry_count(3)
+    .with_retry_min_delay(Duration::from_millis(50))
+    .with_retry_max_delay(Duration::from_secs(1))
+    .build()
+    .await?;
 client.use_keyspace().await?;
 
 let rows = client
@@ -66,9 +58,11 @@ println!("received {} row(s)", rows.len());
 ```
 
 See [`examples/connect.rs`](examples/connect.rs) for a runnable version.
-The `config::ScyllaClientConfig` rustdoc includes a complete YAML example with
-human-readable retry durations. A missing `retry` block, or omitted fields
-inside it, use `RetryConfig::default()`.
+The builder requires comma-separated contact endpoints and an unquoted CQL
+keyspace name. It defaults to 64 concurrent queries, replication factor 1, a
+5-second request timeout, and three retries with exponential backoff between
+50ms and 1s. Applications own configuration deserialization and can pass their
+typed settings through the `with_*` methods.
 
 ## Behavior
 
@@ -93,6 +87,7 @@ inside it, use `RetryConfig::default()`.
   server-advertised peer, preferring IPv4 when the endpoint resolves to both
   address families and defaulting to port `9042` when omitted. Multiple
   configured endpoints use the driver's advertised topology unchanged.
+- Builder settings are validated before endpoint resolution or connection.
 - Public operations return
   `errors::ScyllaClientResult<T>` with matchable, non-exhaustive error
   categories and preserved source chains.

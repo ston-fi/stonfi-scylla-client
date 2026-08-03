@@ -22,11 +22,12 @@ It does not own application schema design, durable migration history,
 application metrics serving, credential management, load-balancing policy
 selection, or a general CQL parser.
 
-Public APIs remain module-qualified under `client`, `config`, `errors`, and
-`simple_migrator`. The root `scylla` re-export is intentional: consumers need
-the exact driver types and derives that match the client. Do not add parallel
-root re-exports, aliases, builders, or compatibility wrappers without a
-demonstrated downstream need.
+Public APIs remain module-qualified under `client`, `errors`, and
+`simple_migrator`. Construct clients only through `ScyllaClient::builder`; do
+not add parallel constructors, configuration types, root re-exports, aliases,
+or compatibility wrappers without a demonstrated downstream need. The root
+`scylla` re-export is intentional: consumers need the exact driver types and
+derives that match the client.
 
 Internal address translation belongs in `address_translator.rs`. Keep it
 private and configure it through `ScyllaClient`; do not expose driver sessions
@@ -37,22 +38,21 @@ or parallel connection constructors.
 Applications should:
 
 1. call `stonfi_metrics::init_metrics!()` during startup;
-2. deserialize or construct `ScyllaClientConfig`;
-3. call `ScyllaClient::new(&config).await`; and
+2. deserialize application-owned settings;
+3. pass those settings through `ScyllaClient::builder(endpoints, keyspace)` and
+   call `build().await`; and
 4. call `use_keyspace()` only after the keyspace exists.
 
-`ScyllaClient::new` validates configuration before connecting. Clones share the
-session, prepared statements, and semaphore. The crate requires Tokio but does
-not spawn or own background tasks.
+The builder validates settings before connecting. Clones share the session,
+prepared statements, and semaphore. The crate requires Tokio but does not spawn
+or own background tasks.
 
-The public configuration fields are an intentional serialization and
-struct-literal contract. Preserve their names and types unless a versioned
-breaking change is explicitly requested. `endpoints` is a comma-separated
-string so generic environment configuration loaders can override it directly.
-The request timeout and retry delays are `Duration` values deserialized through
-`humantime_serde`; missing retry blocks and fields use the documented
-`RetryConfig` defaults. Configuration structs reject unknown fields. Add
-validation at construction rather than silently normalizing invalid values.
+The builder requires comma-separated endpoints and an unquoted CQL keyspace
+name. It defaults to 64 concurrent queries, replication factor 1, a 5-second
+request timeout, and three retries with exponential backoff between 50ms and
+1s. Applications own configuration deserialization; do not add a parallel
+library configuration type or serde contract. Add validation in `build()`
+rather than silently normalizing invalid values.
 When exactly one endpoint is configured, the client resolves it and translates
 all server-advertised peer addresses to that endpoint, preferring IPv4 when
 available and defaulting to port `9042` when omitted. Multiple endpoints use the
@@ -71,7 +71,8 @@ driver's advertised topology unchanged.
   bounded `caller` metric label. Internal callers are fixed names.
 - Preserve per-statement configuration through the upstream driver's
   `CachingSession`, except for statement-level retry policies, which the client
-  overrides so `RetryConfig` remains the sole retry owner. Do not add a second
+  overrides so the builder-configured retry policy remains the sole retry
+  owner. Do not add a second
   prepared-statement cache.
 - Never interpolate untrusted values into unprepared CQL.
 - Keep prepared statements marked idempotent only while all supported query
@@ -115,7 +116,7 @@ manually or create release tags outside the validated release workflow.
 
 - Do not use `unwrap`, `expect`, or panic-driven control flow in production
   code.
-- Do not bypass `ScyllaClientConfig` validation.
+- Do not bypass builder validation or add another connection constructor.
 - Do not add an `execute` alias beside `execute_unprepared`.
 - Do not make retry behavior implicit for new operations; document whether and
   why they are retried.

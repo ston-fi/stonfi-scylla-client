@@ -5,14 +5,14 @@ use thiserror::Error;
 /// Result type returned by Scylla client and migration operations.
 pub type ScyllaClientResult<T> = Result<T, ScyllaClientError>;
 
-/// Errors produced while configuring or using the Scylla client.
+/// Errors produced while building or using the Scylla client.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ScyllaClientError {
-    /// A configuration field violates a client invariant.
+    /// A builder setting violates a client invariant.
     #[error("invalid configuration field `{field}`: {reason}")]
     InvalidConfig {
-        /// Name of the invalid field.
+        /// Logical name of the invalid setting.
         field: &'static str,
         /// Human-readable invariant that was violated.
         reason: String,
