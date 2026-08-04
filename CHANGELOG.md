@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## [0.2.1](https://github.com/ston-fi/stonfi-scylla-client/compare/v0.2.0...v0.2.1) - 2026-08-04
+
+### Other
+
+- support lockfile-free workflows
+
 ### Changed
 
 - Run CI and release automation without a tracked `Cargo.lock`, using the
