@@ -112,6 +112,10 @@ variable only inside the release job. The initial publication requires a token
 with `publish-new`; never commit or print registry credentials. Do not publish
 manually or create release tags outside the validated release workflow.
 
+This library intentionally does not track `Cargo.lock`. Keep it ignored and do
+not pass `--locked` to repository validation or automation; clean checkouts
+resolve the current dependency versions allowed by the manifest.
+
 ## Common mistakes
 
 - Do not use `unwrap`, `expect`, or panic-driven control flow in production
@@ -131,27 +135,27 @@ manually or create release tags outside the validated release workflow.
 Fast gate:
 
 ```text
-cargo test --lib --locked
-cargo test --doc --locked
-cargo test --examples --locked
+cargo test --lib
+cargo test --doc
+cargo test --examples
 cargo +nightly fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Full gate:
 
 ```text
 docker info
-cargo test --lib --locked
-cargo test --doc --locked
-cargo test --examples --locked
-cargo test --test test_client --locked -- --test-threads=1
+cargo test --lib
+cargo test --doc
+cargo test --examples
+cargo test --test test_client -- --test-threads=1
 cargo +nightly fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features --locked
-cargo +1.88.0 check --all-features --locked
-cargo package --list --locked
-cargo publish --dry-run --locked
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features
+cargo +1.88.0 check --all-features
+cargo package --list
+cargo publish --dry-run
 git diff --check
 ```
 

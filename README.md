@@ -126,24 +126,28 @@ dollar-quoted values.
 ## Development
 
 Docker is required for the integration test.
+This library intentionally leaves `Cargo.lock` untracked. A clean checkout
+resolves the current dependency versions allowed by the manifest; Cargo may
+create an ignored local lockfile while running these commands.
 
 ```bash
 docker info
-cargo test --lib --locked
-cargo test --doc --locked
-cargo test --examples --locked
-cargo test --test test_client --locked -- --test-threads=1
+cargo test --lib
+cargo test --doc
+cargo test --examples
+cargo test --test test_client -- --test-threads=1
 cargo +nightly fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features --locked
-cargo +1.88.0 check --all-features --locked
-cargo package --list --locked
-cargo publish --dry-run --locked
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --no-deps --all-features
+cargo +1.88.0 check --all-features
+cargo package --list
+cargo publish --dry-run
 git diff --check
 ```
 
-Merges to `main` run release-plz after all validation jobs succeed. Release-plz
-publishes an unpublished manifest version to crates.io, creates the matching
-`v<version>` Git tag and GitHub Release, checks SemVer compatibility, and opens
-or updates the next version and changelog pull request. The workflow reads the
-crates.io API token from the `CRATES_IO_REGISTRY_TOKEN` GitHub Actions secret.
+Merges to `main` run release-plz only after the `CI` workflow succeeds for the
+same commit. Release-plz publishes an unpublished manifest version to
+crates.io, creates the matching `v<version>` Git tag and GitHub Release, checks
+SemVer compatibility, and opens or updates the next version and changelog pull
+request. The release workflow reads the crates.io API token from the
+`CRATES_IO_REGISTRY_TOKEN` GitHub Actions secret.

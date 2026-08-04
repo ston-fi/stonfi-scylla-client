@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Run CI and release automation without a tracked `Cargo.lock`, using the
+  dependency versions currently allowed by the manifest.
+
 ## [0.2.0](https://github.com/ston-fi/stonfi-scylla-client/compare/v0.1.0...v0.2.0) - 2026-08-03
 
 ### Other
